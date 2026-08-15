@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: vet, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          check-latest: true
+
+      - name: Confirm the dependency-free claim
+        run: |
+          # The project's whole premise is that it imports nothing outside the
+          # standard library. Fail the build the moment that stops being true.
+          if [ -f go.sum ]; then
+            echo "go.sum exists, which means a third-party module was added" >&2
+            exit 1
+          fi
+          if grep -qE '^\s*require' go.mod; then
+            echo "go.mod declares requirements" >&2
+            cat go.mod >&2
+            exit 1
+          fi
+          echo "No third-party modules. Standard library only."
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test with the race detector
+        run: go test -race -count=1 ./...
+
+      - name: build
+        run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/pixelforge ./cmd/pixelforge
+
+  integration:
+    name: integration against PostgreSQL
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pixelforge
+          POSTGRES_PASSWORD: pixelforge
+          POSTGRES_DB: pixelforge
+          POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+          POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U pixelforge"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: run the server and exercise it
+        env:
+          DATABASE_URL: postgres://pixelforge:pixelforge@127.0.0.1:5432/pixelforge?sslmode=disable
+          APP_SECRET: ci-secret
+          COOLDOWN_MS: '0'
+          PORT: '8080'
+        run: |
+          set -euo pipefail
+          go build -o /tmp/pixelforge ./cmd/pixelforge
+          /tmp/pixelforge & PID=$!
+          for _ in $(seq 1 40); do curl -sf localhost:8080/readyz >/dev/null && break; sleep 0.5; done
+
+          curl -sf localhost:8080/readyz
+          curl -sf -c /tmp/jar localhost:8080/api/config >/dev/null
+          curl -sf -b /tmp/jar -X POST localhost:8080/api/place \
+               -H 'Content-Type: application/json' -d '{"x":4,"y":5,"c":7}' >/dev/null
+          sleep 1
+
+          # The placement must be visible in the snapshot and recorded in history.
+          test "$(curl -sf 'localhost:8080/api/history?after=0&limit=10' | grep -c '"x":4')" -ge 1
+          curl -sf localhost:8080/api/snapshot -o /tmp/snap.bin
+          test "$(head -c 4 /tmp/snap.bin)" = "PXF1"
+
+          kill -TERM $PID; wait $PID || true
+
+          # Restarting must restore the canvas from the shutdown snapshot.
+          /tmp/pixelforge & PID=$!
+          for _ in $(seq 1 40); do curl -sf localhost:8080/readyz >/dev/null && break; sleep 0.5; done
+          seq=$(curl -sf localhost:8080/api/config | grep -o '"seq":[0-9]*' | cut -d: -f2)
+          echo "restored sequence: $seq"
+          test "$seq" -ge 1
+          kill -TERM $PID; wait $PID || true
+
+  image:
+    name: container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: pixelforge:ci
+          build-args: VERSION=ci
+      - name: report image size
+        run: docker image inspect pixelforge:ci --format 'image size: {{.Size}} bytes'

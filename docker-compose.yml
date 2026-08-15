@@ -1,0 +1,45 @@
+# Local development: the app plus a PostgreSQL matching what a managed provider
+# hands you. `docker compose up --build` then open http://localhost:8080
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pixelforge
+      POSTGRES_PASSWORD: pixelforge
+      POSTGRES_DB: pixelforge
+      # Force SCRAM so local development exercises the same authentication path
+      # as production rather than the trust shortcut Postgres images default to.
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pixelforge -d pixelforge"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build:
+      context: .
+      args:
+        VERSION: local
+    environment:
+      DATABASE_URL: postgres://pixelforge:pixelforge@db:5432/pixelforge?sslmode=disable
+      APP_SECRET: change-me-in-production
+      CANVAS_WIDTH: "256"
+      CANVAS_HEIGHT: "256"
+      COOLDOWN_MS: "750"
+      LOG_FORMAT: text
+      LOG_LEVEL: info
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:

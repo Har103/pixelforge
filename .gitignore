@@ -1,0 +1,17 @@
+# build output — anchored to the repository root so they cannot swallow
+# cmd/pixelforge/, which an unanchored "pixelforge" pattern happily does
+/pixelforge
+/pixelforge.exe
+/bin/
+/dist/
+
+# local environment
+.env
+.env.local
+*.log
+
+# editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
