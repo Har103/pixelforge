@@ -200,9 +200,11 @@ alongside it.
 4. Deploy. The `Dockerfile` at the repository root is a standard multi-stage
    build with no build arguments required.
 
-The container listens on `$PORT` (default 8080), answers `GET /healthz` for
-liveness and `GET /readyz` for readiness — `/readyz` fails while the database is
-unreachable, so traffic can be held back until the app can actually serve.
+The container listens on whatever `$PORT` says (8080 if unset; Dockup injects
+its own, which is why no port configuration is needed). It answers `GET /healthz`
+for liveness and `GET /readyz` for readiness — `/readyz` fails while the database
+is unreachable, so traffic can be held back until the app can actually serve.
+Point the service's health check at `/readyz`.
 
 If the database is attached after the app is already running, restart the
 service; the driver only reads `DATABASE_URL` at boot.
@@ -290,6 +292,30 @@ Worth singling out:
 CI additionally runs an integration job against a real PostgreSQL 16 with
 `scram-sha-256` forced, paints a pixel, restarts the server, and asserts the
 canvas came back.
+
+## Security surface
+
+With no OS packages in the image and no third-party modules in the binary, the
+Go toolchain is the *entire* dependency surface. A container scanner run against
+this image finds exactly one component: `stdlib`. That is a real benefit — and a
+real obligation, because it means the toolchain pin in the `Dockerfile` is the
+only lever there is.
+
+It is worth being concrete about this, because it is easy to mistake "zero
+dependencies" for "zero CVEs". The first deploy of this repository was built on
+`golang:1.23-alpine` and scanned at grade **F: 1 critical, 21 high, 23 medium**.
+Every one of those 43 findings was `stdlib@v1.23.12` — Go 1.23 went end-of-life
+when Go 1.25 shipped, so it stopped receiving the patches. Not one finding came
+from application code or from a library, because there are none. Bumping the
+pin to `golang:1.26.6-alpine` clears them.
+
+So: **pin the builder to an exact patch release and bump it deliberately.** A
+floating `golang:1-alpine` would have hidden the problem behind whatever the
+registry happened to serve that day; an EOL pin freezes you on unpatched
+cryptography. Neither is a policy. Watching one line is.
+
+The scanner also flags `FROM scratch` as an unpinned base image. That one is
+noise — scratch is the empty image and has nothing to pin.
 
 ## Things I would do next
 

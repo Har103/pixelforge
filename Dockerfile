@@ -1,5 +1,10 @@
 # ---------------------------------------------------------------- build ------
-FROM golang:1.23-alpine AS build
+# Pinned to an exact patch release, not a floating major. The image carries no
+# OS packages and no third-party modules, so the Go toolchain is the entire
+# attack surface of the shipped binary - every CVE a scanner can find here is a
+# stdlib CVE, and the only lever is this line. Go 1.24 and earlier are
+# end-of-life as of Go 1.26.
+FROM golang:1.26.6-alpine AS build
 
 RUN apk add --no-cache ca-certificates
 
