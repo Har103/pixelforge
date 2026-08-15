@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -498,15 +499,25 @@ func (s *Server) handlePNG(w http.ResponseWriter, r *http.Request, rm *room.Room
 	scale, _ := strconv.Atoi(r.URL.Query().Get("scale"))
 	pixels, _ := rm.Canvas.Snapshot()
 
+	// Render into a buffer before writing anything. Encoding straight into the
+	// ResponseWriter means the 200 and the Content-Type are already sent by the
+	// time the encoder can fail, and the caller gets a successful response with
+	// an empty body - a broken image that a CDN or a link unfurler will happily
+	// cache. An absurd ?scale= is exactly that case.
+	var buf bytes.Buffer
+	if err := render.EncodePNG(&buf, pixels, rm.Canvas.Width(), rm.Canvas.Height(),
+		rm.Canvas.Palette(), scale); err != nil {
+		s.Log.Warn("rendering png", "room", rm.Slug(), "scale", scale, "err", err)
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("Cache-Control", "public, max-age=15")
+	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
 	w.Header().Set("Content-Disposition",
 		fmt.Sprintf("inline; filename=%q", rm.Slug()+".png"))
-
-	if err := render.EncodePNG(w, pixels, rm.Canvas.Width(), rm.Canvas.Height(),
-		rm.Canvas.Palette(), scale); err != nil {
-		s.Log.Error("rendering png", "room", rm.Slug(), "err", err)
-	}
+	_, _ = w.Write(buf.Bytes())
 }
 
 // handleCard renders the Open Graph image. It is what a link to a room turns
@@ -518,15 +529,20 @@ func (s *Server) handleCard(w http.ResponseWriter, r *http.Request, rm *room.Roo
 	subtitle := fmt.Sprintf("%d x %d  -  %d pixels painted  -  paint one at %s",
 		stats.Width, stats.Height, stats.Painted, hostOf(s.absolute("/r/"+rm.Slug())))
 
+	var buf bytes.Buffer
+	if err := render.SocialCard(&buf, pixels, stats.Width, stats.Height,
+		rm.Canvas.Palette(), rm.Meta.Name, subtitle); err != nil {
+		s.Log.Error("rendering social card", "room", rm.Slug(), "err", err)
+		http.Error(w, "preview unavailable", http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "image/png")
 	// Short cache: the preview should look current, but a burst of unfurls
 	// from one paste should not each re-render.
 	w.Header().Set("Cache-Control", "public, max-age=60")
-
-	if err := render.SocialCard(w, pixels, stats.Width, stats.Height,
-		rm.Canvas.Palette(), rm.Meta.Name, subtitle); err != nil {
-		s.Log.Error("rendering social card", "room", rm.Slug(), "err", err)
-	}
+	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+	_, _ = w.Write(buf.Bytes())
 }
 
 func hostOf(u string) string {
@@ -555,17 +571,22 @@ func (s *Server) handleGIF(w http.ResponseWriter, r *http.Request, rm *room.Room
 
 	frames, _ := strconv.Atoi(r.URL.Query().Get("frames"))
 
-	w.Header().Set("Content-Type", "image/gif")
-	w.Header().Set("Cache-Control", "public, max-age=30")
-	w.Header().Set("Content-Disposition",
-		fmt.Sprintf("inline; filename=%q", rm.Slug()+"-timelapse.gif"))
-
-	if err := render.EncodeTimelapse(w, placements, render.TimelapseOptions{
+	var buf bytes.Buffer
+	if err := render.EncodeTimelapse(&buf, placements, render.TimelapseOptions{
 		Width:   rm.Canvas.Width(),
 		Height:  rm.Canvas.Height(),
 		Palette: rm.Canvas.Palette(),
 		Frames:  frames,
 	}); err != nil {
-		s.Log.Error("encoding timelapse", "room", rm.Slug(), "err", err)
+		s.Log.Warn("encoding timelapse", "room", rm.Slug(), "frames", frames, "err", err)
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
 	}
+
+	w.Header().Set("Content-Type", "image/gif")
+	w.Header().Set("Cache-Control", "public, max-age=30")
+	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+	w.Header().Set("Content-Disposition",
+		fmt.Sprintf("inline; filename=%q", rm.Slug()+"-timelapse.gif"))
+	_, _ = w.Write(buf.Bytes())
 }

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -539,5 +540,44 @@ func TestValidUsername(t *testing.T) {
 		if validUsername(bad) {
 			t.Errorf("validUsername(%q) = true, want false", bad)
 		}
+	}
+}
+
+// TestExportsFailLoudly pins a bug found by attacking my own product with the
+// same probes I aimed at a competitor: the export handlers used to encode
+// straight into the ResponseWriter, so an absurd ?scale= produced HTTP 200 with
+// an empty body - a broken image that a CDN or a link unfurler would cache as
+// if it were fine. Rendering into a buffer first means a failure is a failure.
+func TestExportsFailLoudlyRatherThanServingAnEmptyBody(t *testing.T) {
+	srv := newServer(t, testDSN(t))
+	c := newClient()
+	slug, _ := createRoom(t, c, srv.URL, map[string]any{"name": "Absurd scale", "width": 32, "height": 32})
+
+	res, err := c.Get(srv.URL + "/r/" + slug + "/canvas.png?scale=99999")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+
+	if res.StatusCode == http.StatusOK && len(body) == 0 {
+		t.Error("an impossible scale returned 200 with an empty body")
+	}
+	if res.StatusCode == http.StatusOK {
+		t.Errorf("an impossible scale should not be a success, got %d", res.StatusCode)
+	}
+
+	// And a sane scale must still work, with a length the client can trust.
+	res2, err := c.Get(srv.URL + "/r/" + slug + "/canvas.png?scale=4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, _ := io.ReadAll(res2.Body)
+	res2.Body.Close()
+	if res2.StatusCode != http.StatusOK || len(good) < 100 {
+		t.Errorf("a normal export broke: %d, %d bytes", res2.StatusCode, len(good))
+	}
+	if cl := res2.Header.Get("Content-Length"); cl != strconv.Itoa(len(good)) {
+		t.Errorf("Content-Length = %q but body is %d bytes", cl, len(good))
 	}
 }
