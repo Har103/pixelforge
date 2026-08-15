@@ -47,6 +47,8 @@ jobs:
 
       - name: go test with the race detector
         run: go test -race -count=1 ./...
+        # The API tests skip without PIXELFORGE_TEST_DSN; the integration job
+        # below supplies one so they actually run somewhere.
 
       - name: build
         run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/pixelforge ./cmd/pixelforge
@@ -73,9 +75,15 @@ jobs:
         with:
           go-version: '1.26'
 
+      - name: API integration tests against a real database
+        env:
+          PIXELFORGE_TEST_DSN: postgres://pixelforge:pixelforge@127.0.0.1:5432/pixelforge?sslmode=disable
+        run: go test -race -count=1 ./internal/httpapi/
+
       - name: run the server and exercise it
         env:
           DATABASE_URL: postgres://pixelforge:pixelforge@127.0.0.1:5432/pixelforge?sslmode=disable
+          BASE_URL: http://localhost:8080
           APP_SECRET: ci-secret
           COOLDOWN_MS: '0'
           PORT: '8080'
@@ -87,21 +95,30 @@ jobs:
 
           curl -sf localhost:8080/readyz
           curl -sf -c /tmp/jar localhost:8080/api/config >/dev/null
-          curl -sf -b /tmp/jar -X POST localhost:8080/api/place \
+          # Create a room through the API, paint in it, and check the exports.
+          SLUG=$(curl -sf -c /tmp/jar -X POST localhost:8080/api/rooms \
+                 -H 'Content-Type: application/json' \
+                 -d '{"name":"ci canvas","width":32,"height":32,"cooldownMs":0}' \
+                 | grep -o '"slug":"[^"]*"' | cut -d'"' -f4)
+          test -n "$SLUG"
+          curl -sf -b /tmp/jar -X POST "localhost:8080/api/r/$SLUG/place" \
                -H 'Content-Type: application/json' -d '{"x":4,"y":5,"c":7}' >/dev/null
           sleep 1
 
-          # The placement must be visible in the snapshot and recorded in history.
-          test "$(curl -sf 'localhost:8080/api/history?after=0&limit=10' | grep -c '"x":4')" -ge 1
-          curl -sf localhost:8080/api/snapshot -o /tmp/snap.bin
+          test "$(curl -sf "localhost:8080/api/r/$SLUG/history?after=0&limit=10" | grep -c '"x":4')" -ge 1
+          curl -sf "localhost:8080/api/r/$SLUG/snapshot" -o /tmp/snap.bin
           test "$(head -c 4 /tmp/snap.bin)" = "PXF1"
+          curl -sf "localhost:8080/r/$SLUG/card.png" -o /tmp/card.png
+          test "$(head -c 4 /tmp/card.png | tail -c 3)" = "PNG"
+          curl -sf "localhost:8080/r/$SLUG/timelapse.gif" -o /tmp/tl.gif
+          test "$(head -c 3 /tmp/tl.gif)" = "GIF"
 
           kill -TERM $PID; wait $PID || true
 
           # Restarting must restore the canvas from the shutdown snapshot.
           /tmp/pixelforge & PID=$!
           for _ in $(seq 1 40); do curl -sf localhost:8080/readyz >/dev/null && break; sleep 0.5; done
-          seq=$(curl -sf localhost:8080/api/config | grep -o '"seq":[0-9]*' | cut -d: -f2)
+          seq=$(curl -sf "localhost:8080/api/r/$SLUG/config" | grep -o '"seq":[0-9]*' | head -1 | cut -d: -f2)
           echo "restored sequence: $seq"
           test "$seq" -ge 1
           kill -TERM $PID; wait $PID || true

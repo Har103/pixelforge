@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ROOM_NAME}} — Pixelforge</title>
+<meta name="robots" content="noindex">
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body class="embed" data-slug="{{ROOM_SLUG}}">
+  <main class="embed-stage" id="stage">
+    <canvas id="board" aria-label="Shared pixel canvas, read only"></canvas>
+  </main>
+  <a class="embed-badge" id="embedLink" href="/r/{{ROOM_SLUG}}" target="_blank" rel="noopener">
+    <span class="brand-mark sm" aria-hidden="true"></span>
+    <span class="embed-name">{{ROOM_NAME}}</span>
+    <span class="embed-cta">paint →</span>
+  </a>
+<script src="/assets/embed.js"></script>
+</body>
+</html>

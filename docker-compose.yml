@@ -29,9 +29,7 @@ services:
     environment:
       DATABASE_URL: postgres://pixelforge:pixelforge@db:5432/pixelforge?sslmode=disable
       APP_SECRET: change-me-in-production
-      CANVAS_WIDTH: "256"
-      CANVAS_HEIGHT: "256"
-      COOLDOWN_MS: "750"
+      BASE_URL: http://localhost:8080
       LOG_FORMAT: text
       LOG_LEVEL: info
     ports:

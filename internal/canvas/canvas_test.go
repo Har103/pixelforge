@@ -8,7 +8,7 @@ import (
 )
 
 func TestPlaceWritesAndAdvancesSequence(t *testing.T) {
-	c := New(16, 16, 0)
+	c := New(16, 16, Palette, 0)
 	now := time.Now()
 
 	p, err := c.Place(3, 4, 6, "alice", now)
@@ -28,7 +28,7 @@ func TestPlaceWritesAndAdvancesSequence(t *testing.T) {
 }
 
 func TestPlaceRejectsOutOfBounds(t *testing.T) {
-	c := New(8, 8, 0)
+	c := New(8, 8, Palette, 0)
 	now := time.Now()
 	for _, tc := range [][2]int{{-1, 0}, {0, -1}, {8, 0}, {0, 8}, {99, 99}} {
 		if _, err := c.Place(tc[0], tc[1], 1, "u", now); !errors.Is(err, ErrOutOfBounds) {
@@ -38,14 +38,14 @@ func TestPlaceRejectsOutOfBounds(t *testing.T) {
 }
 
 func TestPlaceRejectsColourOutsidePalette(t *testing.T) {
-	c := New(8, 8, 0)
+	c := New(8, 8, Palette, 0)
 	if _, err := c.Place(0, 0, uint8(len(Palette)), "u", time.Now()); !errors.Is(err, ErrBadColour) {
 		t.Errorf("error = %v, want ErrBadColour", err)
 	}
 }
 
 func TestPlaceRejectsRepaintingTheSameColour(t *testing.T) {
-	c := New(8, 8, 0)
+	c := New(8, 8, Palette, 0)
 	now := time.Now()
 	if _, err := c.Place(1, 1, 5, "u", now); err != nil {
 		t.Fatal(err)
@@ -56,7 +56,7 @@ func TestPlaceRejectsRepaintingTheSameColour(t *testing.T) {
 }
 
 func TestCooldownBlocksThenExpires(t *testing.T) {
-	c := New(8, 8, time.Second)
+	c := New(8, 8, Palette, time.Second)
 	t0 := time.Now()
 
 	if _, err := c.Place(0, 0, 1, "bob", t0); err != nil {
@@ -75,7 +75,7 @@ func TestCooldownBlocksThenExpires(t *testing.T) {
 }
 
 func TestCooldownRemaining(t *testing.T) {
-	c := New(8, 8, 2*time.Second)
+	c := New(8, 8, Palette, 2*time.Second)
 	t0 := time.Now()
 	if _, err := c.Place(0, 0, 1, "dave", t0); err != nil {
 		t.Fatal(err)
@@ -93,7 +93,7 @@ func TestCooldownRemaining(t *testing.T) {
 }
 
 func TestSnapshotIsACopy(t *testing.T) {
-	c := New(4, 4, 0)
+	c := New(4, 4, Palette, 0)
 	pixels, _ := c.Snapshot()
 	pixels[0] = 99
 	fresh, _ := c.Snapshot()
@@ -103,7 +103,7 @@ func TestSnapshotIsACopy(t *testing.T) {
 }
 
 func TestLoadRejectsWrongSize(t *testing.T) {
-	c := New(4, 4, 0)
+	c := New(4, 4, Palette, 0)
 	if err := c.Load(make([]byte, 15), 0); err == nil {
 		t.Error("expected an error loading a mis-sized snapshot")
 	}
@@ -116,7 +116,7 @@ func TestLoadRejectsWrongSize(t *testing.T) {
 }
 
 func TestApplyIgnoresInvalidInput(t *testing.T) {
-	c := New(4, 4, 0)
+	c := New(4, 4, Palette, 0)
 	c.Apply(-1, 0, 1, 5)
 	c.Apply(0, 0, 200, 5) // colour outside the palette
 	pixels, seq := c.Snapshot()
@@ -131,7 +131,7 @@ func TestApplyIgnoresInvalidInput(t *testing.T) {
 }
 
 func TestStatsCountsPaintedCells(t *testing.T) {
-	c := New(10, 10, 0)
+	c := New(10, 10, Palette, 0)
 	now := time.Now()
 	for i := 0; i < 5; i++ {
 		if _, err := c.Place(i, 0, 7, "u"+string(rune('a'+i)), now); err != nil {
@@ -154,7 +154,7 @@ func TestStatsCountsPaintedCells(t *testing.T) {
 }
 
 func TestClearResetsEveryCell(t *testing.T) {
-	c := New(6, 6, 0)
+	c := New(6, 6, Palette, 0)
 	now := time.Now()
 	_, _ = c.Place(1, 1, 3, "u", now)
 	before := c.Seq()
@@ -173,7 +173,7 @@ func TestClearResetsEveryCell(t *testing.T) {
 // goroutines painting at once must produce exactly one sequence number per
 // successful placement, with no lost updates.
 func TestConcurrentPlacesAreSerialised(t *testing.T) {
-	c := New(64, 64, 0)
+	c := New(64, 64, Palette, 0)
 	const workers = 16
 	const each = 100
 
@@ -210,7 +210,7 @@ func TestConcurrentPlacesAreSerialised(t *testing.T) {
 }
 
 func TestConcurrentSnapshotDuringPlacement(t *testing.T) {
-	c := New(32, 32, 0)
+	c := New(32, 32, Palette, 0)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

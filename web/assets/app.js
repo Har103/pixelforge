@@ -9,6 +9,15 @@
 
 (() => {
 
+// Every endpoint is scoped to the room in the URL. The slug is injected by the
+// server into the page rather than parsed out of location, so a rewritten path
+// or a trailing slash cannot change which canvas the client talks to.
+// The slug travels on <body data-slug>, not an inline <script>. Inline scripts
+// would need 'unsafe-inline' in the Content Security Policy, and weakening the
+// policy for one string is a bad trade.
+const SLUG = document.body.dataset.slug || '';
+const API = '/api/r/' + SLUG;
+
 // ------------------------------------------------------------------ state --
 
 const S = {
@@ -32,6 +41,10 @@ const S = {
   lapse: null,           // { entries, index, playing, base }
   placements: 0,
   dirty: true,
+  room: null,
+  owner: false,
+  paused: false,
+  locks: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -44,7 +57,9 @@ const el = {
   feedList: $('feedList'), cdFill: $('cdFill'), cooldownText: $('cooldownText'),
   toast: $('toast'), sheet: $('sheet'), sheetBody: $('sheetBody'),
   timelapse: $('timelapse'), scrub: $('scrub'), timelapseLabel: $('timelapseLabel'),
-  btnPlay: $('btnPlay'), ephemeralBadge: $('ephemeralBadge'),
+  btnPlay: $('btnPlay'), pausedBadge: $('pausedBadge'),
+  roomName: $('roomName'), roomSub: $('roomSub'),
+  btnOwner: $('btnOwner'), btnShare: $('btnShare'), btnGif: $('btnGif'),
 };
 
 const ctx = el.board.getContext('2d', { alpha: false });
@@ -162,6 +177,34 @@ function render() {
     ctx.stroke();
   }
 
+  // Locked regions, hatched so they read as off-limits rather than decorative
+  if (S.locks.length) {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,159,28,.55)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([5, 4]);
+    S.locks.forEach((l) => {
+      const x1 = Math.min(l.X1, l.X2), y1 = Math.min(l.Y1, l.Y2);
+      const x2 = Math.max(l.X1, l.X2), y2 = Math.max(l.Y1, l.Y2);
+      ctx.strokeRect(ox + x1 * scale, oy + y1 * scale,
+                     (x2 - x1 + 1) * scale, (y2 - y1 + 1) * scale);
+    });
+    ctx.restore();
+  }
+
+  // The rectangle being dragged out in lock mode
+  if (S.lockMode && S.lockStart && S.lockEnd) {
+    const x1 = Math.min(S.lockStart.x, S.lockEnd.x), y1 = Math.min(S.lockStart.y, S.lockEnd.y);
+    const x2 = Math.max(S.lockStart.x, S.lockEnd.x), y2 = Math.max(S.lockStart.y, S.lockEnd.y);
+    ctx.save();
+    ctx.fillStyle = 'rgba(255,159,28,.16)';
+    ctx.strokeStyle = '#ff9f1c';
+    ctx.lineWidth = 2;
+    ctx.fillRect(ox + x1 * scale, oy + y1 * scale, (x2 - x1 + 1) * scale, (y2 - y1 + 1) * scale);
+    ctx.strokeRect(ox + x1 * scale, oy + y1 * scale, (x2 - x1 + 1) * scale, (y2 - y1 + 1) * scale);
+    ctx.restore();
+  }
+
   // Hover cell
   if (S.hover && !S.lapse) {
     const hx = ox + S.hover.x * scale, hy = oy + S.hover.y * scale;
@@ -263,6 +306,12 @@ function cooldownTick() {
 
 const canPlace = () => Date.now() >= S.readyAt;
 
+function setPaused(paused) {
+  S.paused = paused;
+  el.pausedBadge.hidden = !paused;
+  document.body.classList.toggle('is-paused', paused);
+}
+
 // ------------------------------------------------------------------- feed --
 
 function pushFeed(x, y, colorIndex) {
@@ -280,8 +329,16 @@ function pushFeed(x, y, colorIndex) {
 
 // -------------------------------------------------------------- placement --
 
+function lockedAt(x, y) {
+  return S.locks.some((l) =>
+    x >= Math.min(l.X1, l.X2) && x <= Math.max(l.X1, l.X2) &&
+    y >= Math.min(l.Y1, l.Y2) && y <= Math.max(l.Y1, l.Y2));
+}
+
 function tryPlace(x, y) {
   if (S.lapse) { toast('exit time-lapse to paint'); return; }
+  if (S.paused) { toast('the owner has paused this canvas', 'warn'); return; }
+  if (lockedAt(x, y)) { toast('that area is locked', 'warn'); return; }
   if (!canPlace()) {
     toast('cooling down — ' + ((S.readyAt - Date.now()) / 1000).toFixed(1) + 's', 'warn');
     return;
@@ -299,7 +356,7 @@ function tryPlace(x, y) {
     S.socket.send(JSON.stringify(payload));
     return;
   }
-  fetch('/api/place', {
+  fetch(API + '/place', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ x, y, c: S.color }),
@@ -354,7 +411,7 @@ function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   let sock;
   try {
-    sock = new WebSocket(proto + '//' + location.host + '/ws');
+    sock = new WebSocket(proto + '//' + location.host + API + '/ws');
   } catch (e) {
     fallbackToSSE('websocket unavailable');
     return;
@@ -399,7 +456,7 @@ function fallbackToSSE(why) {
 }
 
 function connectSSE() {
-  const src = new EventSource('/sse');
+  const src = new EventSource(API + '/sse');
   S.events = src;
   setConn('wait', 'connecting');
   src.onopen = () => {
@@ -455,6 +512,26 @@ function handleJSON(raw) {
       toast(msg.reason || 'placement rejected', 'warn');
       loadSnapshot(true);
       break;
+    case 'room':
+      if (typeof msg.paused === 'boolean') setPaused(msg.paused);
+      if (msg.name) {
+        S.room.name = msg.name;
+        el.roomName.textContent = msg.name;
+        document.title = msg.name + ' — Pixelforge';
+      }
+      break;
+    case 'locks':
+      S.locks = msg.locks || [];
+      S.dirty = true;
+      break;
+    case 'cleared':
+      toast('the owner cleared the canvas', 'warn');
+      loadSnapshot(true);
+      break;
+    case 'rebuilt':
+      toast(`${msg.undone} placement${msg.undone === 1 ? '' : 's'} were undone`, 'warn');
+      loadSnapshot(true);
+      break;
   }
   updatePaintedStat();
 }
@@ -474,7 +551,7 @@ function updatePaintedStat() {
 // ------------------------------------------------------------------- load --
 
 async function loadSnapshot(silent) {
-  const res = await fetch('/api/snapshot', { cache: 'no-store' });
+  const res = await fetch(API + '/snapshot', { cache: 'no-store' });
   if (!res.ok) throw new Error('snapshot request failed: ' + res.status);
   const buf = new Uint8Array(await res.arrayBuffer());
   if (buf.length < 16 || buf[0] !== 80 || buf[1] !== 88 || buf[2] !== 70 || buf[3] !== 49) {
@@ -502,7 +579,7 @@ async function loadSnapshot(silent) {
 
 async function loadStats() {
   try {
-    const res = await fetch('/api/stats');
+    const res = await fetch(API + '/stats');
     if (!res.ok) return;
     const j = await res.json();
     S.placements = j.placements || 0;
@@ -518,7 +595,7 @@ async function startTimelapse() {
   toast('loading history…');
   let entries = [];
   try {
-    const res = await fetch('/api/history?after=0&limit=30000');
+    const res = await fetch(API + '/history?after=0&limit=30000');
     if (!res.ok) throw new Error();
     entries = (await res.json()).entries || [];
   } catch (e) {
@@ -580,6 +657,15 @@ function lapseStep() {
 function openSheet(html) {
   el.sheetBody.innerHTML = html;
   el.sheet.hidden = false;
+  el.sheetBody.querySelectorAll('[data-copy]').forEach((b) => {
+    b.addEventListener('click', () => {
+      const input = document.getElementById(b.dataset.copy);
+      input.select();
+      navigator.clipboard.writeText(input.value)
+        .then(() => toast('copied'))
+        .catch(() => toast('press Ctrl/⌘+C to copy'));
+    });
+  });
 }
 function closeSheet() { el.sheet.hidden = true; }
 
@@ -648,6 +734,173 @@ async function statsSheet() {
   `);
 }
 
+
+// ----------------------------------------------------------------- share ---
+
+function shareSheet() {
+  const url = S.cfg.shareUrl || location.origin + '/r/' + SLUG;
+  const embed = `<iframe src="${S.cfg.embedUrl || location.origin + '/embed/' + SLUG}" width="480" height="520" style="border:0;border-radius:12px" title="${escapeAttr(S.room.name)}"></iframe>`;
+  openSheet(`
+    <h2>Share this canvas</h2>
+    <p>Anyone with the link can paint. Nothing to install and no account needed.</p>
+    <div class="copyrow"><input readonly id="shUrl" value="${escapeAttr(url)}"><button class="ghost" data-copy="shUrl">copy</button></div>
+
+    <h3>Preview</h3>
+    <p>This is what the link turns into when it is pasted into Slack, Discord or
+    a timeline — rendered from the canvas as it looks right now.</p>
+    <img class="card-preview" src="/r/${encodeURIComponent(SLUG)}/card.png?t=${Date.now()}" alt="Link preview for this canvas">
+
+    <h3>Embed it</h3>
+    <p>A read-only view that keeps syncing, for a wiki page or a stream overlay.</p>
+    <div class="copyrow"><input readonly id="shEmbed" value="${escapeAttr(embed)}"><button class="ghost" data-copy="shEmbed">copy</button></div>
+
+    <h3>Take it with you</h3>
+    <div class="sheet-actions">
+      <a class="ghost linkish" href="/r/${encodeURIComponent(SLUG)}/canvas.png?scale=8" download>PNG</a>
+      <a class="ghost linkish" href="/r/${encodeURIComponent(SLUG)}/timelapse.gif" download>time-lapse GIF</a>
+    </div>
+  `);
+}
+
+function escapeAttr(v) {
+  return String(v == null ? '' : v).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// ----------------------------------------------------------- moderation ---
+
+async function mod(path, body) {
+  const res = await fetch(API + '/mod/' + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(out.error || 'that did not work');
+  return out;
+}
+
+async function manageSheet() {
+  openSheet('<h2>Manage</h2><p>Loading…</p>');
+  let stats = {};
+  try { stats = await (await fetch(API + '/stats')).json(); } catch (e) { /* best effort */ }
+  const painters = (stats.leaderboard || []).slice(0, 12);
+
+  openSheet(`
+    <h2>Manage this canvas</h2>
+
+    <h3>Right now</h3>
+    <div class="sheet-actions">
+      <button class="ghost" id="mPause">${S.paused ? 'Resume painting' : 'Pause painting'}</button>
+      <button class="ghost" id="mLock">Lock a region</button>
+      <button class="ghost" id="mUnlock" ${S.locks.length ? '' : 'disabled'}>Clear ${S.locks.length} lock${S.locks.length === 1 ? '' : 's'}</button>
+    </div>
+    <p class="hint">Pausing freezes the canvas for everyone but leaves it visible.
+    A locked region stays exactly as it is; the rest of the canvas keeps going.</p>
+
+    <h3>Settings</h3>
+    <label class="field"><span class="field-label">Name</span>
+      <input type="text" id="mName" maxlength="60" value="${escapeAttr(S.room.name)}"></label>
+    <label class="check"><input type="checkbox" id="mUnlisted" ${S.room.visibility === 'unlisted' ? 'checked' : ''}>
+      <span>Unlisted — reachable by link, kept off the browse page</span></label>
+    <div class="sheet-actions"><button class="ghost" id="mSave">Save settings</button></div>
+
+    <h3>Painters</h3>
+    ${painters.length ? `<table class="painters">${painters.map((pn) => `
+      <tr>
+        <td>${escapeAttr(pn.uid)}${pn.uid === S.cfg.uid ? ' <em>(you)</em>' : ''}</td>
+        <td>${pn.count.toLocaleString()}</td>
+        <td class="painter-actions">
+          <button class="ghost sm" data-undo="${escapeAttr(pn.uid)}">undo all</button>
+          <button class="ghost sm" data-ban="${escapeAttr(pn.uid)}">block</button>
+        </td>
+      </tr>`).join('')}</table>
+      <p class="hint">Undoing a painter removes every pixel they placed and rebuilds
+      the canvas from the log, so whatever they painted over comes back.</p>`
+      : '<p>Nobody has painted here yet.</p>'}
+
+    <h3 class="danger-head">Clear everything</h3>
+    <p>Wipes the grid to background. The history is kept, so a time-lapse still
+    shows what was there.</p>
+    <div class="sheet-actions"><button class="danger" id="mClear">Clear the canvas</button></div>
+  `);
+
+  $('mPause').addEventListener('click', async () => {
+    try {
+      const out = await mod('pause', { paused: !S.paused });
+      setPaused(out.paused);
+      toast(out.paused ? 'canvas paused' : 'painting resumed');
+      closeSheet();
+    } catch (e) { toast(e.message, 'bad'); }
+  });
+
+  $('mLock').addEventListener('click', () => {
+    S.lockMode = true;
+    closeSheet();
+    toast('drag on the canvas to lock a rectangle');
+  });
+
+  $('mUnlock').addEventListener('click', async () => {
+    try {
+      await mod('locks', { locks: [] });
+      S.locks = [];
+      S.dirty = true;
+      toast('locks cleared');
+      closeSheet();
+    } catch (e) { toast(e.message, 'bad'); }
+  });
+
+  $('mSave').addEventListener('click', async () => {
+    try {
+      const out = await mod('settings', {
+        name: $('mName').value,
+        visibility: $('mUnlisted').checked ? 'unlisted' : 'public',
+      });
+      S.room = out.room || S.room;
+      el.roomName.textContent = S.room.name;
+      toast('saved');
+      closeSheet();
+    } catch (e) { toast(e.message, 'bad'); }
+  });
+
+  $('mClear').addEventListener('click', async () => {
+    if (!confirm('Clear every pixel on this canvas?')) return;
+    try {
+      await mod('clear');
+      await loadSnapshot(true);
+      toast('canvas cleared');
+      closeSheet();
+    } catch (e) { toast(e.message, 'bad'); }
+  });
+
+  el.sheetBody.querySelectorAll('[data-ban]').forEach((b) => b.addEventListener('click', async () => {
+    try { await mod('ban', { uid: b.dataset.ban }); toast('blocked ' + b.dataset.ban); }
+    catch (e) { toast(e.message, 'bad'); }
+  }));
+  el.sheetBody.querySelectorAll('[data-undo]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm('Undo everything ' + b.dataset.undo + ' painted?')) return;
+    try {
+      const out = await mod('undo', { uid: b.dataset.undo });
+      await loadSnapshot(true);
+      toast(`undid ${out.undone} placement${out.undone === 1 ? '' : 's'}`);
+      closeSheet();
+    } catch (e) { toast(e.message, 'bad'); }
+  }));
+}
+
+async function commitLock(a, b) {
+  const lock = {
+    X1: Math.min(a.x, b.x), Y1: Math.min(a.y, b.y),
+    X2: Math.max(a.x, b.x), Y2: Math.max(a.y, b.y),
+  };
+  try {
+    const out = await mod('locks', { locks: S.locks.concat([lock]) });
+    S.locks = out.locks || [];
+    S.dirty = true;
+    toast('region locked');
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
 // ----------------------------------------------------------------- input --
 
 function bindInput() {
@@ -665,6 +918,7 @@ function bindInput() {
     }
     dragging = true; moved = false;
     lastX = downX = e.clientX; lastY = downY = e.clientY;
+    if (S.lockMode) { S.lockStart = screenToCell(e.clientX, e.clientY); }
   });
 
   el.stage.addEventListener('pointermove', (e) => {
@@ -691,6 +945,12 @@ function bindInput() {
       S.dirty = true;
     }
 
+    if (S.lockMode && S.lockStart && dragging) {
+      S.lockEnd = cell;
+      S.dirty = true;
+      lastX = e.clientX; lastY = e.clientY;
+      return;
+    }
     if (!dragging) return;
     const dx = e.clientX - lastX, dy = e.clientY - lastY;
     if (Math.abs(e.clientX - downX) > 3 || Math.abs(e.clientY - downY) > 3) {
@@ -710,6 +970,14 @@ function bindInput() {
     if (!dragging) return;
     dragging = false;
     el.stage.classList.remove('panning');
+
+    if (S.lockMode) {
+      const end = screenToCell(e.clientX, e.clientY) || S.lockEnd;
+      if (S.lockStart && end) commitLock(S.lockStart, end);
+      S.lockMode = false; S.lockStart = null; S.lockEnd = null;
+      S.dirty = true;
+      return;
+    }
     if (moved) return;
     const cell = screenToCell(e.clientX, e.clientY);
     if (!cell) return;
@@ -755,6 +1023,8 @@ function bindInput() {
   $('btnZoomOut').addEventListener('click', () => zoomAt(1 / 1.3));
   $('btnFit').addEventListener('click', fitToScreen);
   $('btnHelp').addEventListener('click', helpSheet);
+  el.btnShare.addEventListener('click', shareSheet);
+  el.btnOwner.addEventListener('click', manageSheet);
   $('btnStats').addEventListener('click', statsSheet);
   $('btnSheetClose').addEventListener('click', closeSheet);
   el.sheet.addEventListener('click', (e) => { if (e.target === el.sheet) closeSheet(); });
@@ -795,8 +1065,13 @@ function bindInput() {
 // ------------------------------------------------------------------- boot --
 
 async function boot() {
+  if (!SLUG) {
+    el.bootMsg.className = 'error';
+    el.bootMsg.textContent = 'This page did not tell the client which canvas to load.';
+    return;
+  }
   try {
-    const res = await fetch('/api/config');
+    const res = await fetch(API + '/config');
     if (!res.ok) throw new Error('config request failed: ' + res.status);
     S.cfg = await res.json();
   } catch (e) {
@@ -805,11 +1080,22 @@ async function boot() {
     return;
   }
 
-  S.palette = S.cfg.palette || [];
+  S.room = S.cfg.room || {};
+  S.palette = S.room.palette || [];
   S.rgb = S.palette.map(hexToRGB);
-  S.cooldownMs = S.cfg.cooldownMs ?? 750;
+  S.cooldownMs = S.room.cooldownMs ?? 750;
   S.color = S.palette.length > 6 ? 6 : 1;
-  el.ephemeralBadge.hidden = !S.cfg.ephemeral;
+  S.owner = !!S.cfg.owner;
+  S.locks = S.room.locks || [];
+  setPaused(!!S.room.paused);
+
+  el.roomName.textContent = S.room.name || 'Canvas';
+  document.title = (S.room.name || 'Canvas') + ' — Pixelforge';
+  el.roomSub.textContent = `${S.room.width}×${S.room.height} · ${
+    S.cooldownMs ? (S.cooldownMs >= 1000 ? (S.cooldownMs / 1000) + 's' : S.cooldownMs + 'ms') + ' cooldown' : 'no cooldown'
+  }${S.room.visibility === 'unlisted' ? ' · unlisted' : ''}`;
+  el.btnOwner.hidden = !S.owner;
+  el.btnGif.href = '/r/' + SLUG + '/timelapse.gif';
 
   buildPalette();
   resize();

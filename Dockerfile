@@ -48,10 +48,7 @@ COPY --from=build /out/pixelforge /pixelforge
 USER pixelforge
 
 ENV PORT=8080 \
-    LOG_FORMAT=json \
-    CANVAS_WIDTH=256 \
-    CANVAS_HEIGHT=256 \
-    COOLDOWN_MS=750
+    LOG_FORMAT=json
 
 EXPOSE 8080
 

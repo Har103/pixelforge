@@ -1,7 +1,7 @@
-// Command pixelforge serves a shared, live pixel canvas.
+// Command pixelforge serves shared pixel canvases.
 //
-// Everything here is standard library only - the PostgreSQL driver and the
-// WebSocket server included. See internal/pg and internal/ws.
+// Everything here is standard library only - the PostgreSQL driver, the
+// WebSocket server, the password hashing and the image encoders included.
 package main
 
 import (
@@ -19,10 +19,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Har103/pixelforge/internal/canvas"
+	"github.com/Har103/pixelforge/internal/auth"
 	"github.com/Har103/pixelforge/internal/httpapi"
-	"github.com/Har103/pixelforge/internal/hub"
 	"github.com/Har103/pixelforge/internal/pg"
+	"github.com/Har103/pixelforge/internal/room"
+	"github.com/Har103/pixelforge/internal/store"
 	"github.com/Har103/pixelforge/web"
 )
 
@@ -63,21 +64,14 @@ func run() error {
 	slog.SetDefault(log)
 
 	cfg := loadConfig()
-	log.Info("starting pixelforge",
-		"version", version,
-		"port", cfg.Port,
-		"canvas", fmt.Sprintf("%dx%d", cfg.Width, cfg.Height),
-		"cooldown", cfg.Cooldown,
-	)
+	log.Info("starting pixelforge", "version", version, "port", cfg.Port, "baseURL", cfg.BaseURL)
 
-	board := canvas.New(cfg.Width, cfg.Height, cfg.Cooldown)
-
-	// The database is optional. Without one the canvas still works, it just
-	// does not survive a restart - which beats crash-looping in front of
-	// whoever is looking at the deployment.
+	// The database is optional. Without one the service still serves, it just
+	// cannot create rooms - which beats crash-looping in front of whoever is
+	// looking at the deployment.
 	var pool *pg.Pool
 	if dbCfg, err := pg.ConfigFromEnv(); err != nil {
-		log.Warn("running without persistence", "reason", err)
+		log.Warn("running without persistence; rooms are unavailable", "reason", err)
 	} else {
 		log.Info("connecting to postgres", "target", dbCfg.Redacted())
 		pool = pg.NewPool(dbCfg, cfg.PoolSize, log)
@@ -92,43 +86,39 @@ func run() error {
 		log.Info("postgres connected")
 	}
 
-	store := canvas.NewStore(pool, board, log)
+	st := store.New(pool, log)
 
-	bootCtx, cancelBoot := context.WithTimeout(context.Background(), 60*time.Second)
-	if err := store.Migrate(bootCtx); err != nil {
-		cancelBoot()
-		return err
-	}
-	if err := store.Restore(bootCtx); err != nil {
+	bootCtx, cancelBoot := context.WithTimeout(context.Background(), 120*time.Second)
+	if err := st.Migrate(bootCtx); err != nil {
 		cancelBoot()
 		return err
 	}
 	cancelBoot()
 
-	broker := hub.New(log)
+	registry := room.NewRegistry(st, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	hubDone := make(chan struct{})
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); broker.Run(hubDone) }()
-	go func() { defer wg.Done(); store.Run(ctx) }()
+	wg.Add(1)
+	go func() { defer wg.Done(); registry.Run(ctx) }()
 
-	srv := &httpapi.Server{
-		Canvas:  board,
-		Store:   store,
-		Hub:     broker,
-		Log:     log,
-		Static:  web.FS(),
-		Version: version,
-		Secret:  cfg.Secret,
+	api := &httpapi.Server{
+		Rooms:           registry,
+		Store:           st,
+		Signer:          auth.NewSigner(cfg.Secret),
+		Secret:          cfg.Secret,
+		Log:             log,
+		Static:          web.FS(),
+		Version:         version,
+		BaseURL:         cfg.BaseURL,
+		RateLimitPerMin: cfg.RateLimit,
 	}
 
 	httpServer := &http.Server{
 		Addr:    ":" + cfg.Port,
-		Handler: srv.Routes(),
+		Handler: api.Routes(),
 		// No WriteTimeout: SSE and WebSocket connections are long-lived by
 		// design and a write deadline would cut them off mid-stream.
 		ReadHeaderTimeout: 10 * time.Second,
@@ -154,20 +144,19 @@ func run() error {
 		log.Info("shutdown signal received, draining")
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Warn("http shutdown", "err", err)
 	}
-	close(hubDone)
-	stop() // cancels ctx so store.Run drains and writes its final snapshot
+	stop() // cancels ctx so every room drains and writes its final snapshot
 
 	waited := make(chan struct{})
 	go func() { wg.Wait(); close(waited) }()
 	select {
 	case <-waited:
-	case <-time.After(25 * time.Second):
-		log.Warn("background workers did not finish in time")
+	case <-time.After(30 * time.Second):
+		log.Warn("rooms did not finish shutting down in time")
 	}
 
 	log.Info("stopped cleanly")
@@ -175,33 +164,32 @@ func run() error {
 }
 
 type config struct {
-	Port     string
-	Width    int
-	Height   int
-	Cooldown time.Duration
-	PoolSize int
-	Secret   []byte
+	Port      string
+	PoolSize  int
+	Secret    []byte
+	BaseURL   string
+	RateLimit int
 }
 
 func loadConfig() config {
 	c := config{
-		Port:     envStr("PORT", "8080"),
-		Width:    envInt("CANVAS_WIDTH", 256, 16, 1024),
-		Height:   envInt("CANVAS_HEIGHT", 256, 16, 1024),
-		Cooldown: time.Duration(envInt("COOLDOWN_MS", 750, 0, 3_600_000)) * time.Millisecond,
-		PoolSize: envInt("DB_POOL_SIZE", 4, 1, 32),
+		Port:      envStr("PORT", "8080"),
+		PoolSize:  envInt("DB_POOL_SIZE", 6, 1, 32),
+		BaseURL:   strings.TrimRight(envStr("BASE_URL", ""), "/"),
+		RateLimit: envInt("RATE_LIMIT_PER_MIN", 600, 10, 100000),
 	}
 
 	if s := strings.TrimSpace(os.Getenv("APP_SECRET")); s != "" {
 		c.Secret = []byte(s)
 	} else {
-		// A per-boot secret means identity cookies are invalidated on restart,
-		// which resets everyone's cooldown. Fine for a demo, worth a warning.
+		// A per-boot secret invalidates every identity cookie, session and
+		// moderator key on restart. Survivable for a demo, fatal for a room
+		// somebody expects to still own tomorrow - hence the warning.
 		c.Secret = make([]byte, 32)
 		if _, err := rand.Read(c.Secret); err != nil {
 			c.Secret = []byte("pixelforge-insecure-fallback-secret")
 		}
-		slog.Warn("APP_SECRET is not set, generating a random one - identity cookies will not survive a restart")
+		slog.Warn("APP_SECRET is not set: sessions and moderator keys will not survive a restart")
 	}
 	return c
 }

@@ -1,14 +1,20 @@
 # Pixelforge
 
-A shared pixel canvas. Everyone who has it open is painting on the same grid, and
-every placement lands on every other screen in about a tenth of a second.
+Make a shared pixel canvas in one click. Send the link. Everyone paints on the
+same grid, live.
 
-![The Pixelforge canvas](docs/screenshot.png)
+![The Pixelforge home page](docs/home.png)
 
-The interesting part is not the canvas. It is that **the entire thing is Go's
-standard library** — the PostgreSQL driver and the WebSocket server included.
-`go.mod` has no `require` block and there is no `go.sum`. CI fails the build if
-either of those stops being true.
+No signup, nothing to install. Whoever creates a canvas gets moderator control
+of it; everyone else just needs the URL. Every room exports as a PNG, replays as
+an animated GIF, embeds as a live read-only iframe, and unfurls in Slack or
+Discord as a picture of itself.
+
+The engineering constraint underneath all of it: **the entire thing is Go's
+standard library.** The PostgreSQL driver, the WebSocket server, the password
+hashing and the image encoders are all written in this repository. `go.mod` has
+no `require` block and there is no `go.sum`, and CI fails the build if either
+stops being true.
 
 ```
 $ go list -deps ./... | grep -v '^github.com/Har103/pixelforge' \
@@ -25,6 +31,7 @@ ship inside the toolchain — nothing is fetched to build this.)
 ## Contents
 
 - [What it does](#what-it-does)
+- [Sharing](#sharing)
 - [Why it is built this way](#why-it-is-built-this-way)
 - [Architecture](#architecture)
 - [Running it](#running-it)
@@ -39,27 +46,56 @@ ship inside the toolchain — nothing is fetched to build this.)
 
 ## What it does
 
-- **A live shared grid.** Pan, zoom, and click a cell to paint it. Every other
-  connected client sees it immediately.
-- **Two realtime transports.** WebSocket by default, Server-Sent Events as an
-  automatic fallback when a proxy will not carry an upgrade. There is a toggle in
-  the top right so you can watch both paths work against the same server.
-- **A per-user cooldown**, enforced server-side against an HMAC-signed identity
-  cookie, so clearing the cookie is the only way to dodge it and forging one is
-  not.
-- **Full history and a time-lapse.** Every placement is appended to PostgreSQL.
-  The scrubber replays the canvas from empty to now.
-- **Statistics** — colour histogram, top painters, how much of the grid is
-  painted, all straight out of SQL.
-- **Survives restarts.** The canvas is snapshotted to the database periodically
-  and on shutdown; on boot it loads the snapshot and replays anything newer.
+**Rooms.** Anyone can create a canvas: pick a size, a palette and a cooldown,
+and you get a link. Public rooms appear on the browse page with a live
+thumbnail; unlisted ones are reachable only by URL.
+
+**Ownership without a signup wall.** Creating a room hands you a moderator key —
+stored as a cookie for this browser, and shown once as a recovery link to save.
+Accounts exist and keep your rooms together across devices, but painting never
+needs one, and neither does making a canvas. A login form in front of "draw with
+your friends" is a product bug.
+
+**Moderation, because any public canvas needs it within a day.** The owner can
+pause the room, lock rectangles so a finished area stays finished, clear the
+grid, block a painter, or undo every pixel one person placed — with whatever
+they painted over restored from the log rather than guessed. Per-address rate
+limiting backs up the per-painter cooldown, which a script defeats by throwing
+its cookie away.
+
+**Live, two ways.** WebSocket by default, with an automatic fallback to
+Server-Sent Events for networks that will not carry an upgrade; there is a
+toggle in the room so you can watch both paths work. Updates are coalesced on a
+50&nbsp;ms tick, so a paint storm costs a handful of frames a second instead of
+hundreds.
+
+**It remembers.** Every placement is appended to PostgreSQL and each grid is
+snapshotted, so a restart brings every canvas back exactly as it was. Scrub the
+whole history in the browser, or export it.
+
+**Five palettes**, from a twenty-colour default to four shades of Game Boy
+green, because a constraint is often what makes the picture.
 
 <table>
 <tr>
-<td><img src="docs/timelapse.png" alt="Time-lapse scrubber replaying the canvas"></td>
-<td><img src="docs/stats.png" alt="Statistics panel"></td>
+<td><img src="docs/room.png" alt="A canvas mid-paint"></td>
+<td><img src="docs/manage.png" alt="The moderation panel"></td>
 </tr>
 </table>
+
+## Sharing
+
+This is the part a kanban clone has no equivalent of, and it costs nothing
+extra: `image/png` and `image/gif` are in the standard library.
+
+| What | Where | Notes |
+|---|---|---|
+| **Link preview** | `/r/{slug}/card.png` | A 1200×630 Open Graph card rendered from the canvas *as it looks right now*, with the room name drawn in a bitmap font defined in code. Paste a room link into Slack, Discord or a timeline and it unfurls as a picture of itself. |
+| **PNG export** | `/r/{slug}/canvas.png?scale=8` | Nearest-neighbour at any integer scale, so pixels stay pixels. |
+| **Time-lapse GIF** | `/r/{slug}/timelapse.gif` | The placement log replayed from empty to now, encoded server-side. |
+| **Live embed** | `/embed/{slug}` | A read-only canvas that keeps syncing, for a wiki page or a stream overlay. It sets no credentials and can do nothing on a visitor's behalf. |
+
+![The Open Graph card a room link unfurls into](docs/card.png)
 
 ## Why it is built this way
 
@@ -81,39 +117,52 @@ per second instead of hundreds.
 ## Architecture
 
 ```
-   browser ──── WebSocket (binary deltas) ────┐
-   browser ──── SSE (JSON deltas) ────────────┤
-   browser ──── POST /api/place ──────────┐   │
-                                          ▼   ▼
-                            ┌──────────────────────────────┐
-                            │  canvas.Canvas               │  authoritative
-                            │  one byte per cell, RWMutex  │  grid, in memory
-                            │  cooldown per identity       │
-                            └───────┬──────────────┬───────┘
-                        placement   │              │  placement
-                                    ▼              ▼
-                         ┌────────────────┐  ┌──────────────────┐
-                         │ hub.Hub        │  │ canvas.Store     │
-                         │ 50 ms coalesce │  │ write-behind     │
-                         │ fan out        │  │ queue + batching │
-                         └────────────────┘  └────────┬─────────┘
-                                                      │
-                                             ┌────────▼─────────┐
-                                             │ internal/pg      │
-                                             │ v3 wire protocol │
-                                             │ SCRAM-SHA-256    │
-                                             └────────┬─────────┘
-                                                      ▼
-                                                 PostgreSQL
-                                         placements (append-only log)
-                                         snapshots  (one bytea row)
+                    ┌──────────────────────────────────┐
+   browser ───────► │ httpapi                          │
+                    │  /r/{slug}  routing, ownership,  │
+                    │  rate limiting, exports          │
+                    └───────────────┬──────────────────┘
+                                    │ Get(slug)
+                    ┌───────────────▼──────────────────┐
+                    │ room.Registry                    │  lazy load,
+                    │  resident rooms, single-flight,  │  idle eviction,
+                    │  idle sweep, eviction cap        │  64 resident max
+                    └───────────────┬──────────────────┘
+                     ┌──────────────┴───────────────┐
+                     ▼                              ▼
+            ┌──────────────────┐          ┌──────────────────┐
+            │ room.Room        │   ...    │ room.Room        │
+            │  canvas.Canvas   │          │  one per live    │
+            │  hub.Hub (50ms)  │          │  canvas          │
+            │  write-behind    │          │                  │
+            └────────┬─────────┘          └──────────────────┘
+                     │
+            ┌────────▼─────────┐   ┌──────────────────┐
+            │ store            │   │ render           │
+            │  every SQL       │   │  PNG, OG card,   │
+            │  statement       │   │  GIF time-lapse  │
+            └────────┬─────────┘   └──────────────────┘
+                     │
+            ┌────────▼─────────┐
+            │ pg               │  v3 wire protocol, SCRAM-SHA-256
+            └────────┬─────────┘
+                     ▼
+                 PostgreSQL
+        rooms · room_placements · room_snapshots · users · bans
 ```
 
+A room is loaded on first request and released after twenty idle minutes with
+nobody connected, so a thousand dormant canvases cost rows in Postgres rather
+than a thousand resident grids. Concurrent requests for a cold room collapse
+onto one load; without that, a burst of traffic to a shared link would each
+build a grid and start a pair of goroutines, and all but one would be discarded.
+
 The write path never blocks on the database. `Place` takes the canvas lock,
-validates, writes one byte, and returns; persistence and broadcast both happen
-off the back of a queue. If the database falls far enough behind to fill the
-4,096-entry buffer, history entries are dropped with a warning rather than
-stalling anyone's paint — the next snapshot captures the pixels regardless.
+validates against the cooldown, the bans and the locks, writes one byte, and
+returns; persistence and broadcast both happen off the back of a queue. If the
+database falls far enough behind to fill the buffer, history entries are dropped
+with a warning rather than stalling anyone's paint — the next snapshot captures
+the pixels regardless.
 
 ### `internal/pg` — a PostgreSQL driver, ~1,700 lines
 
@@ -215,32 +264,48 @@ Every value has a working default. Nothing is required.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `PORT` | `8080` | HTTP listen port |
-| `DATABASE_URL` | *(unset)* | `postgres://…` URL or libpq keyword form. `POSTGRES_URL` and `PG_DSN` are also accepted; failing those, the standard `PGHOST`/`PGUSER`/`PGPASSWORD`/`PGDATABASE`/`PGSSLMODE` variables |
-| `APP_SECRET` | *(random per boot)* | Signs the identity cookie. Set it, or every restart resets everyone's cooldown |
-| `CANVAS_WIDTH` | `256` | 16–1024 |
-| `CANVAS_HEIGHT` | `256` | 16–1024 |
-| `COOLDOWN_MS` | `750` | Per-identity delay between placements. `0` disables it |
-| `DB_POOL_SIZE` | `4` | 1–32 |
+| `PORT` | `8080` | HTTP listen port. Dockup injects its own; do not hardcode one |
+| `DATABASE_URL` | *(unset)* | `postgres://…` URL or libpq keyword form. `POSTGRES_URL` and `PG_DSN` also work; failing those, the standard `PGHOST`/`PGUSER`/`PGPASSWORD`/`PGDATABASE`/`PGSSLMODE` variables |
+| `APP_SECRET` | *(random per boot)* | Signs painter ids, sessions and moderator keys. **Set it.** Without it, every restart invalidates every moderator key, and a room somebody expects to still own tomorrow becomes unowned |
+| `BASE_URL` | *(relative)* | Absolute origin, e.g. `https://pixelforge.example`. Link previews and share links need it to be absolute |
+| `RATE_LIMIT_PER_MIN` | `600` | Writes per address per minute. See below |
+| `DB_POOL_SIZE` | `6` | 1–32 |
 | `LOG_FORMAT` | `text` | `json` for structured logs |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 
-Changing the canvas dimensions between deploys is handled: the old snapshot is
-discarded and the placement log is replayed into the new grid.
+Room size, palette and cooldown are per room, chosen at creation, not
+environment variables.
+
+**On the rate limit.** Ten writes a second per address is a real trade rather
+than a formality. Lower and it fights the product — a room with no cooldown is
+meant to be painted fast, and an office or a school shares one address between
+everybody in it. Higher and it stops backing up the per-painter cooldown, which
+a script defeats by discarding its cookie. If you run this behind a proxy that
+does not set `X-Forwarded-For`, every visitor looks like one address and the
+limit will bite; fix the proxy rather than raising the number.
 
 ## HTTP API
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/config` | Dimensions, palette, cooldown, your identity |
-| `GET` | `/api/snapshot` | The whole grid as one binary blob |
-| `POST` | `/api/place` | `{"x":1,"y":2,"c":7}` → `200`, or `429` with `retryInMs` |
-| `GET` | `/api/history?after=&limit=` | Placement log, oldest first |
-| `GET` | `/api/stats` | Canvas stats, leaderboard, uptime |
-| `GET` | `/ws` | WebSocket: binary pixel batches, JSON control messages, and placements in the other direction |
-| `GET` | `/sse` | Server-Sent Events, JSON only |
-| `GET` | `/healthz` | Liveness plus counters |
-| `GET` | `/readyz` | Readiness — fails when the database is unreachable |
+| `GET` | `/api/palettes` | Palettes and the limits the creation form should respect |
+| `GET` | `/api/rooms` | Public rooms, most recently active first |
+| `POST` | `/api/rooms` | Create one. Returns the slug and the moderator key |
+| `GET` | `/api/r/{slug}/config` | Room description, your painter id, whether you are the owner |
+| `GET` | `/api/r/{slug}/snapshot` | The whole grid as one binary blob |
+| `POST` | `/api/r/{slug}/place` | `{"x":1,"y":2,"c":7}` → `200`, or `429` with `retryInMs` |
+| `GET` | `/api/r/{slug}/history` | Placement log, oldest first |
+| `GET` | `/api/r/{slug}/stats` | Canvas stats, painter leaderboard |
+| `GET` | `/api/r/{slug}/ws` | WebSocket: binary pixel batches out, placements in |
+| `GET` | `/api/r/{slug}/sse` | Server-Sent Events, JSON only |
+| `POST` | `/api/r/{slug}/mod/*` | `pause`, `clear`, `ban`, `undo`, `locks`, `settings` — moderator key required |
+| `POST` | `/api/auth/{register,login,logout}` | Optional accounts |
+| `GET` | `/healthz` · `/readyz` | Liveness, and readiness that fails while the database is unreachable |
+
+Moderator authority is proved three ways: the per-room cookie set at creation,
+a `?key=` on the recovery link, or an account that owns the room. Only the HMAC
+of a key is stored, so a database leak does not hand out control of every
+canvas.
 
 ## Wire formats
 
@@ -269,29 +334,30 @@ a client cannot smuggle in an arbitrary colour.
 ## Tests
 
 ```sh
-go test -race ./...
+go test -race ./...                                   # everything that needs no database
+PIXELFORGE_TEST_DSN=postgres://… go test -race ./...  # plus the API integration tests
 ```
 
-Sixty-plus tests, no external services required — the HTTP layer runs against the
-ephemeral (no-database) store, and the WebSocket tests speak real frames over a
-real socket from a hand-written test client.
+The API tests need a real PostgreSQL, because rooms are a database concept and
+mocking the store would only test the mock. They skip cleanly without a DSN.
 
 Worth singling out:
 
-- `TestSCRAMRFC7677Vector` — the authentication exchange against the RFC's
-  worked example
-- `TestConcurrentWritesDoNotInterleave` — 200 frames from 8 goroutines, all
-  arriving intact
+- `TestSCRAMRFC7677Vector` — the database authentication exchange checked
+  against the RFC's own worked example
+- `TestConcurrentWritesDoNotInterleave` — 200 WebSocket frames from 8
+  goroutines, all arriving intact
 - `TestConcurrentPlacesAreSerialised` — 1,600 concurrent placements, no
   duplicate sequence numbers
-- `TestForgedIdentityCookieIsIgnored` — a hand-crafted cookie does not buy you a
-  chosen identity
-- The protocol-violation suite — unmasked frames, reserved bits, oversized
-  control frames, invalid UTF-8, each expecting a specific close code
-
-CI additionally runs an integration job against a real PostgreSQL 16 with
-`scram-sha-256` forced, paints a pixel, restarts the server, and asserts the
-canvas came back.
+- `TestRoomsAreIsolated` — a pixel painted in one room does not appear in another
+- `TestModerationNeedsTheModeratorKey` — every moderation route refuses a
+  stranger, accepts the creator's cookie, and accepts the recovery link's key
+  from a browser that has never seen the room
+- `TestBanAndUndo` — undoing a painter restores what they painted over, from the log
+- `TestZeroCooldownIsHonoured` and `TestRoomPageHasNoInlineScript` — two
+  regressions with stories, described where they live
+- The WebSocket protocol-violation suite — unmasked frames, reserved bits,
+  oversized control frames, invalid UTF-8, each expecting a specific close code
 
 ## Security surface
 
@@ -321,17 +387,20 @@ noise — scratch is the empty image and has nothing to pin.
 
 Honest list, in the order I would do them:
 
-- **Horizontal scale.** One process owns the canvas today, so a second replica
-  would diverge. The fix is `LISTEN`/`NOTIFY` or Redis for cross-instance fanout
-  and optimistic concurrency on the snapshot row — worth doing when one container
-  stops being enough, not before.
-- **Rate limiting by IP** as well as by identity. The cookie cooldown is honest
-  but a script that discards cookies can still outrun it.
-- **Region locking / moderation.** Any public canvas needs it within a day.
-- **`database/sql` compatibility** for `internal/pg`, so it is useful outside
-  this repository.
-- **Time-lapse export to GIF**, server-side, which is the part people actually
-  want to share.
+- **Horizontal scale.** One process owns each resident room, so a second replica
+  would serve a different copy of the same canvas. The fix is to route a slug to
+  a single instance, or to move the fan-out to `LISTEN`/`NOTIFY`. Worth doing
+  when one container stops being enough, not before.
+- **Undo a rectangle, not just a painter.** Undoing a person is the blunt tool;
+  most vandalism is one region by several accounts.
+- **A gallery of finished canvases**, so a room has somewhere to go when it is
+  done rather than sitting on the browse page forever.
+- **Cooldown changes taking effect live.** They are recorded immediately but the
+  running canvas keeps the value it was loaded with, and the API says so rather
+  than pretending otherwise.
+- **Argon2id instead of PBKDF2** for passwords, the day `golang.org/x/crypto`
+  becomes acceptable — which under this project's rule is never, so the real
+  answer is to keep watching whether the standard library grows it.
 
 ## Licence
 

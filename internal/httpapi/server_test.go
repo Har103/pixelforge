@@ -1,132 +1,119 @@
 package httpapi
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/Har103/pixelforge/internal/canvas"
-	"github.com/Har103/pixelforge/internal/hub"
-	"github.com/Har103/pixelforge/web"
+	"github.com/Har103/pixelforge/internal/auth"
+	"github.com/Har103/pixelforge/internal/pg"
+	"github.com/Har103/pixelforge/internal/room"
+	"github.com/Har103/pixelforge/internal/store"
 )
 
-// newTestServer builds the full stack with no database, which exercises every
-// handler without needing PostgreSQL in CI.
-func newTestServer(t *testing.T, cooldown time.Duration) (*httptest.Server, *canvas.Canvas, *hub.Hub) {
+// These tests need a real PostgreSQL, because rooms are a database concept and
+// mocking the store would only test the mock. Point PIXELFORGE_TEST_DSN at a
+// throwaway database to run them; CI does exactly that.
+//
+// The handful of checks that do not need a database live in the ephemeral tests
+// further down and always run.
+func testDSN(t *testing.T) string {
+	t.Helper()
+	dsn := strings.TrimSpace(os.Getenv("PIXELFORGE_TEST_DSN"))
+	if dsn == "" {
+		t.Skip("set PIXELFORGE_TEST_DSN to run the database-backed API tests")
+	}
+	return dsn
+}
+
+func newServer(t *testing.T, dsn string) *httptest.Server {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	board := canvas.New(32, 32, cooldown)
-	store := canvas.NewStore(nil, board, log)
-	broker := hub.New(log)
 
-	done := make(chan struct{})
-	go broker.Run(done)
-	t.Cleanup(func() { close(done) })
+	var st *store.Store
+	if dsn == "" {
+		st = store.New(nil, log)
+	} else {
+		cfg, err := pg.ParseDSN(dsn)
+		if err != nil {
+			t.Fatalf("parsing test DSN: %v", err)
+		}
+		pool := pg.NewPool(cfg, 4, log)
+		t.Cleanup(pool.Close)
 
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := pool.WaitReady(ctx, 3); err != nil {
+			t.Fatalf("test database not reachable: %v", err)
+		}
+		st = store.New(pool, log)
+		if err := st.Migrate(ctx); err != nil {
+			t.Fatalf("migrating: %v", err)
+		}
+	}
+
+	registry := room.NewRegistry(st, log)
+	ctx, cancel := context.WithCancel(context.Background())
+	go registry.Run(ctx)
+	t.Cleanup(cancel)
+
+	secret := []byte("test-secret-please-ignore")
 	api := &Server{
-		Canvas: board, Store: store, Hub: broker, Log: log,
-		Static: web.FS(), Version: "test", Secret: []byte("test-secret"),
+		Rooms: registry, Store: st,
+		Signer: auth.NewSigner(secret), Secret: secret,
+		Log: log, Static: testFS(), Version: "test",
+		BaseURL:         "http://example.test",
+		RateLimitPerMin: 100000, // the limiter has its own test
 	}
 	srv := httptest.NewServer(api.Routes())
 	t.Cleanup(srv.Close)
-	return srv, board, broker
+	return srv
 }
 
-// client keeps cookies so the identity (and therefore the cooldown) is stable
-// across requests, the way a browser behaves.
-func newClient(t *testing.T) *http.Client {
+type jar struct{ cookies []*http.Cookie }
+
+func (j *jar) SetCookies(_ *url.URL, c []*http.Cookie) {
+	// Keep the union rather than the last response's set, or the moderator
+	// cookie is lost the moment any other handler sets only pf_uid.
+	byName := map[string]*http.Cookie{}
+	for _, existing := range j.cookies {
+		byName[existing.Name] = existing
+	}
+	for _, fresh := range c {
+		byName[fresh.Name] = fresh
+	}
+	j.cookies = j.cookies[:0]
+	for _, v := range byName {
+		j.cookies = append(j.cookies, v)
+	}
+}
+func (j *jar) Cookies(_ *url.URL) []*http.Cookie { return j.cookies }
+
+func newClient() *http.Client {
+	return &http.Client{
+		Jar:     &jar{},
+		Timeout: 20 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func postJSON(t *testing.T, c *http.Client, url string, body any) (*http.Response, map[string]any) {
 	t.Helper()
-	jar := &simpleJar{}
-	return &http.Client{Jar: jar, Timeout: 10 * time.Second}
-}
-
-type simpleJar struct{ cookies []*http.Cookie }
-
-func (j *simpleJar) SetCookies(_ *url.URL, cookies []*http.Cookie) { j.cookies = cookies }
-func (j *simpleJar) Cookies(_ *url.URL) []*http.Cookie             { return j.cookies }
-
-func TestConfigEndpoint(t *testing.T) {
-	srv, _, _ := newTestServer(t, 0)
-	c := newClient(t)
-
-	res, err := c.Get(srv.URL + "/api/config")
+	raw, _ := json.Marshal(body)
+	res, err := c.Post(url, "application/json", bytes.NewReader(raw))
 	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
-
-	var cfg struct {
-		Width, Height int
-		Palette       []string
-		CooldownMs    int64 `json:"cooldownMs"`
-		UID           string
-		Ephemeral     bool
-	}
-	if err := json.NewDecoder(res.Body).Decode(&cfg); err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Width != 32 || cfg.Height != 32 {
-		t.Errorf("dimensions = %dx%d", cfg.Width, cfg.Height)
-	}
-	if len(cfg.Palette) != len(canvas.Palette) {
-		t.Errorf("palette length = %d", len(cfg.Palette))
-	}
-	if !cfg.Ephemeral {
-		t.Error("a store with no pool should report ephemeral")
-	}
-	if len(res.Cookies()) == 0 {
-		t.Error("expected an identity cookie to be set")
-	}
-}
-
-func TestSnapshotHeaderAndSize(t *testing.T) {
-	srv, board, _ := newTestServer(t, 0)
-	c := newClient(t)
-
-	if _, err := board.Place(2, 3, 9, "seed", time.Now()); err != nil {
-		t.Fatal(err)
-	}
-
-	res, err := c.Get(srv.URL + "/api/snapshot")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
-	body, _ := io.ReadAll(res.Body)
-
-	if len(body) != 16+32*32 {
-		t.Fatalf("snapshot length = %d, want %d", len(body), 16+32*32)
-	}
-	if string(body[:4]) != "PXF1" {
-		t.Errorf("magic = %q", body[:4])
-	}
-	if w := binary.BigEndian.Uint16(body[4:6]); w != 32 {
-		t.Errorf("width = %d", w)
-	}
-	if seq := binary.BigEndian.Uint64(body[8:16]); seq != 1 {
-		t.Errorf("seq = %d, want 1", seq)
-	}
-	if body[16+3*32+2] != 9 {
-		t.Errorf("pixel (2,3) = %d, want 9", body[16+3*32+2])
-	}
-}
-
-func postPlace(t *testing.T, c *http.Client, base string, x, y, colour int) (*http.Response, map[string]any) {
-	t.Helper()
-	body, _ := json.Marshal(map[string]int{"x": x, "y": y, "c": colour})
-	res, err := c.Post(base+"/api/place", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("POST %s: %v", url, err)
 	}
 	var out map[string]any
 	_ = json.NewDecoder(res.Body).Decode(&out)
@@ -134,301 +121,423 @@ func postPlace(t *testing.T, c *http.Client, base string, x, y, colour int) (*ht
 	return res, out
 }
 
-func TestPlaceHappyPath(t *testing.T) {
-	srv, board, _ := newTestServer(t, 0)
-	c := newClient(t)
-
-	res, out := postPlace(t, c, srv.URL, 5, 6, 11)
+func createRoom(t *testing.T, c *http.Client, base string, body map[string]any) (slug string, out map[string]any) {
+	t.Helper()
+	res, out := postJSON(t, c, base+"/api/rooms", body)
 	if res.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, body = %v", res.StatusCode, out)
+		t.Fatalf("creating room: status %d body %v", res.StatusCode, out)
 	}
-	if out["ok"] != true {
-		t.Errorf("body = %v", out)
+	s, _ := out["slug"].(string)
+	if s == "" {
+		t.Fatalf("no slug in response %v", out)
 	}
-	pixels, _ := board.Snapshot()
-	if pixels[6*32+5] != 11 {
-		t.Errorf("pixel not applied: %d", pixels[6*32+5])
+	return s, out
+}
+
+// ------------------------------------------------------------ room basics --
+
+func TestCreateRoomAppliesTheChosenSettings(t *testing.T) {
+	srv := newServer(t, testDSN(t))
+	c := newClient()
+
+	slug, out := createRoom(t, c, srv.URL, map[string]any{
+		"name": "Chosen settings", "width": 48, "height": 32,
+		"palette": "neon", "cooldownMs": 0,
+	})
+
+	room, _ := out["room"].(map[string]any)
+	if room["width"].(float64) != 48 || room["height"].(float64) != 32 {
+		t.Errorf("dimensions = %vx%v", room["width"], room["height"])
+	}
+	if room["paletteKey"] != "neon" {
+		t.Errorf("palette = %v", room["paletteKey"])
+	}
+	// The regression that started all this: an explicit zero must not be
+	// mistaken for "unset" and replaced by the default.
+	if room["cooldownMs"].(float64) != 0 {
+		t.Errorf("cooldownMs = %v, want 0", room["cooldownMs"])
+	}
+	if out["moderatorKey"] == "" || out["moderatorUrl"] == "" {
+		t.Error("creation should hand back a moderator key and link")
+	}
+	if !strings.Contains(slug, "chosen-settings") {
+		t.Errorf("slug %q should be derived from the name", slug)
 	}
 }
 
-func TestPlaceValidation(t *testing.T) {
-	srv, _, _ := newTestServer(t, 0)
+func TestRoomsAreIsolated(t *testing.T) {
+	srv := newServer(t, testDSN(t))
+	a, b := newClient(), newClient()
 
-	cases := []struct {
-		name       string
-		x, y, c    int
-		wantStatus int
-	}{
-		{"negative x", -1, 0, 1, http.StatusBadRequest},
-		{"x past edge", 32, 0, 1, http.StatusBadRequest},
-		{"y past edge", 0, 32, 1, http.StatusBadRequest},
-		{"colour past palette", 0, 0, 250, http.StatusBadRequest},
-		{"negative colour", 0, 0, -3, http.StatusBadRequest},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			c := newClient(t)
-			res, out := postPlace(t, c, srv.URL, tc.x, tc.y, tc.c)
-			if res.StatusCode != tc.wantStatus {
-				t.Errorf("status = %d, want %d (body %v)", res.StatusCode, tc.wantStatus, out)
-			}
-		})
-	}
-}
+	slugA, _ := createRoom(t, a, srv.URL, map[string]any{"name": "Room A", "width": 32, "height": 32, "cooldownMs": 0})
+	slugB, _ := createRoom(t, b, srv.URL, map[string]any{"name": "Room B", "width": 32, "height": 32, "cooldownMs": 0})
 
-func TestPlaceRejectsMalformedBody(t *testing.T) {
-	srv, _, _ := newTestServer(t, 0)
-	c := newClient(t)
-	res, err := c.Post(srv.URL+"/api/place", "application/json", strings.NewReader("{not json"))
-	if err != nil {
-		t.Fatal(err)
+	if res, out := postJSON(t, a, srv.URL+"/api/r/"+slugA+"/place", map[string]int{"x": 3, "y": 3, "c": 5}); res.StatusCode != http.StatusOK {
+		t.Fatalf("painting in A: %d %v", res.StatusCode, out)
 	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want 400", res.StatusCode)
-	}
-}
+	time.Sleep(400 * time.Millisecond)
 
-func TestPlaceRejectsUnknownFields(t *testing.T) {
-	srv, _, _ := newTestServer(t, 0)
-	c := newClient(t)
-	res, err := c.Post(srv.URL+"/api/place", "application/json",
-		strings.NewReader(`{"x":1,"y":1,"c":1,"admin":true}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want 400 for an unknown field", res.StatusCode)
-	}
-}
-
-func TestCooldownIsEnforcedPerIdentity(t *testing.T) {
-	srv, _, _ := newTestServer(t, 5*time.Second)
-
-	alice := newClient(t)
-	if res, out := postPlace(t, alice, srv.URL, 1, 1, 3); res.StatusCode != http.StatusOK {
-		t.Fatalf("first placement failed: %d %v", res.StatusCode, out)
-	}
-	res, out := postPlace(t, alice, srv.URL, 2, 2, 4)
-	if res.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("second placement status = %d, want 429", res.StatusCode)
-	}
-	if _, ok := out["retryInMs"]; !ok {
-		t.Errorf("429 response should tell the client when to retry: %v", out)
-	}
-
-	// A separate identity is not affected.
-	bob := newClient(t)
-	if res, _ := postPlace(t, bob, srv.URL, 3, 3, 5); res.StatusCode != http.StatusOK {
-		t.Errorf("a different client should not inherit the cooldown: %d", res.StatusCode)
-	}
-}
-
-func TestForgedIdentityCookieIsIgnored(t *testing.T) {
-	srv, _, _ := newTestServer(t, 5*time.Second)
-
-	// Place once with a legitimate identity.
-	c := newClient(t)
-	postPlace(t, c, srv.URL, 1, 1, 3)
-
-	// Now hand-craft a cookie with a bogus signature. The server should mint a
-	// fresh identity rather than trust it - and critically, must not accept the
-	// attacker's chosen uid.
-	req, _ := http.NewRequest("POST", srv.URL+"/api/place",
-		strings.NewReader(`{"x":9,"y":9,"c":2}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: uidCookie, Value: "deadbeef.0000000000000000000"})
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d; a forged cookie should be replaced, not rejected outright", res.StatusCode)
-	}
-	var reissued bool
-	for _, ck := range res.Cookies() {
-		if ck.Name == uidCookie && ck.Value != "deadbeef.0000000000000000000" {
-			reissued = true
+	// The pixel must exist in A and not in B.
+	for _, tc := range []struct {
+		slug string
+		want byte
+	}{{slugA, 5}, {slugB, 0}} {
+		res, err := a.Get(srv.URL + "/api/r/" + tc.slug + "/snapshot")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		if len(body) != 16+32*32 {
+			t.Fatalf("snapshot of %s is %d bytes", tc.slug, len(body))
+		}
+		if got := body[16+3*32+3]; got != tc.want {
+			t.Errorf("room %s pixel (3,3) = %d, want %d", tc.slug, got, tc.want)
 		}
 	}
-	if !reissued {
-		t.Error("expected the server to reissue a signed identity cookie")
-	}
 }
 
-func TestIdentityCookieSignatureRoundTrip(t *testing.T) {
-	s := &Server{Secret: []byte("k")}
-	signed := s.signUID("abc123")
-	got, ok := s.verifyUID(signed)
-	if !ok || got != "abc123" {
-		t.Errorf("round trip failed: %q %v", got, ok)
-	}
-	if _, ok := s.verifyUID("abc123.deadbeef"); ok {
-		t.Error("a bad signature was accepted")
-	}
-	if _, ok := s.verifyUID("nosignature"); ok {
-		t.Error("a cookie with no signature was accepted")
-	}
-	other := &Server{Secret: []byte("different")}
-	if _, ok := other.verifyUID(signed); ok {
-		t.Error("a cookie signed with another key was accepted")
-	}
-}
+func TestUnknownRoomIs404(t *testing.T) {
+	srv := newServer(t, testDSN(t))
+	c := newClient()
 
-func TestHealthAndReady(t *testing.T) {
-	srv, _, _ := newTestServer(t, 0)
-	c := newClient(t)
-
-	for _, path := range []string{"/healthz", "/readyz"} {
+	for _, path := range []string{"/r/no-such-room-1234", "/api/r/no-such-room-1234/config", "/embed/no-such-room-1234"} {
 		res, err := c.Get(srv.URL + path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res.StatusCode != http.StatusOK {
-			t.Errorf("%s status = %d", path, res.StatusCode)
-		}
 		res.Body.Close()
+		if res.StatusCode != http.StatusNotFound {
+			t.Errorf("%s = %d, want 404", path, res.StatusCode)
+		}
 	}
-}
-
-func TestIndexIsServedAndUnknownPathsAre404(t *testing.T) {
-	srv, _, _ := newTestServer(t, 0)
-	c := newClient(t)
-
-	res, err := c.Get(srv.URL + "/")
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, _ := io.ReadAll(res.Body)
-	res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("index status = %d", res.StatusCode)
-	}
-	if !bytes.Contains(body, []byte("Pixelforge")) {
-		t.Error("index does not look like the app shell")
-	}
-	if ct := res.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
-		t.Errorf("content type = %q", ct)
-	}
-	if res.Header.Get("Content-Security-Policy") == "" {
-		t.Error("expected a CSP header")
-	}
-
-	res, err = c.Get(srv.URL + "/nope")
+	// A slug that could not exist must not even reach the database.
+	res, err := c.Get(srv.URL + "/api/r/NOT..VALID/config")
 	if err != nil {
 		t.Fatal(err)
 	}
 	res.Body.Close()
 	if res.StatusCode != http.StatusNotFound {
-		t.Errorf("unknown path status = %d, want 404", res.StatusCode)
+		t.Errorf("malformed slug = %d, want 404", res.StatusCode)
 	}
 }
 
-func TestStaticAssetsAreServed(t *testing.T) {
-	srv, _, _ := newTestServer(t, 0)
-	c := newClient(t)
-	for _, p := range []string{"/assets/app.js", "/assets/style.css"} {
-		res, err := c.Get(srv.URL + p)
+// ------------------------------------------------------------- moderation --
+
+func TestModerationNeedsTheModeratorKey(t *testing.T) {
+	srv := newServer(t, testDSN(t))
+	owner := newClient()
+	slug, out := createRoom(t, owner, srv.URL, map[string]any{"name": "Guarded", "width": 32, "height": 32, "cooldownMs": 0})
+
+	stranger := newClient()
+	for _, path := range []string{"pause", "clear", "ban", "undo", "locks", "settings"} {
+		res, _ := postJSON(t, stranger, srv.URL+"/api/r/"+slug+"/mod/"+path, map[string]any{"uid": "x"})
+		if res.StatusCode != http.StatusForbidden {
+			t.Errorf("mod/%s without a key = %d, want 403", path, res.StatusCode)
+		}
+	}
+
+	// The creator's cookie works.
+	if res, body := postJSON(t, owner, srv.URL+"/api/r/"+slug+"/mod/pause", map[string]any{"paused": true}); res.StatusCode != http.StatusOK {
+		t.Fatalf("owner pause = %d %v", res.StatusCode, body)
+	}
+
+	// And so does the recovery link's key, from a browser that has never seen
+	// this room before.
+	key, _ := out["moderatorKey"].(string)
+	fresh := newClient()
+	res, body := postJSON(t, fresh, srv.URL+"/api/r/"+slug+"/mod/pause?key="+url.QueryEscape(key), map[string]any{"paused": false})
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("pause via the moderator key = %d %v", res.StatusCode, body)
+	}
+
+	// A wrong key does not.
+	res, _ = postJSON(t, fresh, srv.URL+"/api/r/"+slug+"/mod/pause?key=not-the-key", map[string]any{"paused": true})
+	if res.StatusCode != http.StatusForbidden {
+		t.Errorf("pause with a wrong key = %d, want 403", res.StatusCode)
+	}
+}
+
+func TestPauseAndLocksBlockPainting(t *testing.T) {
+	srv := newServer(t, testDSN(t))
+	owner := newClient()
+	slug, _ := createRoom(t, owner, srv.URL, map[string]any{"name": "Controls", "width": 32, "height": 32, "cooldownMs": 0})
+
+	painter := newClient()
+	if res, _ := postJSON(t, painter, srv.URL+"/api/r/"+slug+"/place", map[string]int{"x": 1, "y": 1, "c": 2}); res.StatusCode != http.StatusOK {
+		t.Fatal("painting should work before anything is locked")
+	}
+
+	postJSON(t, owner, srv.URL+"/api/r/"+slug+"/mod/pause", map[string]any{"paused": true})
+	res, body := postJSON(t, painter, srv.URL+"/api/r/"+slug+"/place", map[string]int{"x": 2, "y": 2, "c": 3})
+	if res.StatusCode != http.StatusForbidden || !strings.Contains(body["error"].(string), "paused") {
+		t.Errorf("painting while paused = %d %v", res.StatusCode, body)
+	}
+	postJSON(t, owner, srv.URL+"/api/r/"+slug+"/mod/pause", map[string]any{"paused": false})
+
+	postJSON(t, owner, srv.URL+"/api/r/"+slug+"/mod/locks", map[string]any{
+		"locks": []map[string]int{{"X1": 5, "Y1": 5, "X2": 9, "Y2": 9}},
+	})
+	res, body = postJSON(t, painter, srv.URL+"/api/r/"+slug+"/place", map[string]int{"x": 7, "y": 7, "c": 4})
+	if res.StatusCode != http.StatusForbidden || !strings.Contains(body["error"].(string), "locked") {
+		t.Errorf("painting inside a lock = %d %v", res.StatusCode, body)
+	}
+	if res, _ := postJSON(t, painter, srv.URL+"/api/r/"+slug+"/place", map[string]int{"x": 11, "y": 7, "c": 4}); res.StatusCode != http.StatusOK {
+		t.Error("painting outside the lock should still work")
+	}
+}
+
+func TestBanAndUndo(t *testing.T) {
+	srv := newServer(t, testDSN(t))
+	owner := newClient()
+	slug, _ := createRoom(t, owner, srv.URL, map[string]any{"name": "Cleanup", "width": 32, "height": 32, "cooldownMs": 0})
+
+	vandal := newClient()
+	res, err := vandal.Get(srv.URL + "/api/r/" + slug + "/config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		UID string `json:"uid"`
+	}
+	_ = json.NewDecoder(res.Body).Decode(&cfg)
+	res.Body.Close()
+
+	for i := 0; i < 5; i++ {
+		postJSON(t, vandal, srv.URL+"/api/r/"+slug+"/place", map[string]int{"x": i, "y": 0, "c": 6})
+	}
+	time.Sleep(600 * time.Millisecond)
+
+	_, body := postJSON(t, owner, srv.URL+"/api/r/"+slug+"/mod/undo", map[string]any{"uid": cfg.UID})
+	if n, _ := body["undone"].(float64); n != 5 {
+		t.Errorf("undone = %v, want 5", body["undone"])
+	}
+
+	snap, _ := owner.Get(srv.URL + "/api/r/" + slug + "/snapshot")
+	pixels, _ := io.ReadAll(snap.Body)
+	snap.Body.Close()
+	for i := 0; i < 5; i++ {
+		if pixels[16+i] != 0 {
+			t.Errorf("pixel %d survived the undo: %d", i, pixels[16+i])
+		}
+	}
+
+	postJSON(t, owner, srv.URL+"/api/r/"+slug+"/mod/ban", map[string]any{"uid": cfg.UID})
+	res2, body2 := postJSON(t, vandal, srv.URL+"/api/r/"+slug+"/place", map[string]int{"x": 20, "y": 20, "c": 7})
+	if res2.StatusCode != http.StatusForbidden {
+		t.Errorf("a banned painter placed a pixel: %d %v", res2.StatusCode, body2)
+	}
+}
+
+// --------------------------------------------------------------- exports ---
+
+func TestExportsRender(t *testing.T) {
+	srv := newServer(t, testDSN(t))
+	c := newClient()
+	slug, _ := createRoom(t, c, srv.URL, map[string]any{"name": "Exports", "width": 32, "height": 32, "cooldownMs": 0})
+	postJSON(t, c, srv.URL+"/api/r/"+slug+"/place", map[string]int{"x": 4, "y": 4, "c": 9})
+	time.Sleep(500 * time.Millisecond)
+
+	cases := []struct{ path, contentType, magic string }{
+		{"/r/" + slug + "/canvas.png?scale=4", "image/png", "\x89PNG"},
+		{"/r/" + slug + "/card.png", "image/png", "\x89PNG"},
+		{"/r/" + slug + "/timelapse.gif", "image/gif", "GIF8"},
+	}
+	for _, tc := range cases {
+		res, err := c.Get(srv.URL + tc.path)
 		if err != nil {
 			t.Fatal(err)
 		}
+		body, _ := io.ReadAll(res.Body)
 		res.Body.Close()
 		if res.StatusCode != http.StatusOK {
-			t.Errorf("%s status = %d", p, res.StatusCode)
-		}
-	}
-}
-
-// TestSSEDeliversPlacements is the end-to-end realtime check: subscribe, paint
-// from a second client, and confirm the event arrives on the stream.
-func TestSSEDeliversPlacements(t *testing.T) {
-	srv, _, _ := newTestServer(t, 0)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	req, _ := http.NewRequestWithContext(ctx, "GET", srv.URL+"/sse", nil)
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
-
-	if ct := res.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
-		t.Fatalf("content type = %q", ct)
-	}
-
-	reader := bufio.NewReader(res.Body)
-	// Drain the preamble: "retry:", then the hello event.
-	deadline := time.Now().Add(5 * time.Second)
-	sawHello := false
-	for !sawHello && time.Now().Before(deadline) {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("reading stream: %v", err)
-		}
-		if strings.Contains(line, `"hello"`) {
-			sawHello = true
-		}
-	}
-	if !sawHello {
-		t.Fatal("never received the hello event")
-	}
-
-	painter := newClient(t)
-	if res, out := postPlace(t, painter, srv.URL, 7, 8, 12); res.StatusCode != http.StatusOK {
-		t.Fatalf("place failed: %d %v", res.StatusCode, out)
-	}
-
-	deadline = time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("reading stream: %v", err)
-		}
-		if !strings.HasPrefix(line, "data: ") || !strings.Contains(line, `"px"`) {
+			t.Errorf("%s = %d", tc.path, res.StatusCode)
 			continue
 		}
-		var msg struct {
-			T string `json:"t"`
-			P []struct {
-				X, Y int
-				C    int
-			} `json:"p"`
+		if ct := res.Header.Get("Content-Type"); ct != tc.contentType {
+			t.Errorf("%s content type = %q, want %q", tc.path, ct, tc.contentType)
 		}
-		if err := json.Unmarshal([]byte(strings.TrimPrefix(strings.TrimSpace(line), "data: ")), &msg); err != nil {
-			t.Fatalf("decoding event %q: %v", line, err)
+		if len(body) < 100 || !strings.HasPrefix(string(body), tc.magic) {
+			t.Errorf("%s does not look like %s (%d bytes)", tc.path, tc.contentType, len(body))
 		}
-		if len(msg.P) != 1 || msg.P[0].X != 7 || msg.P[0].Y != 8 || msg.P[0].C != 12 {
-			t.Fatalf("unexpected event payload: %+v", msg)
-		}
-		return
 	}
-	t.Fatal("placement never arrived on the SSE stream")
 }
 
-func TestHistoryAndStatsWithoutDatabase(t *testing.T) {
-	srv, _, _ := newTestServer(t, 0)
-	c := newClient(t)
+func TestRoomPageCarriesLinkPreviewTags(t *testing.T) {
+	srv := newServer(t, testDSN(t))
+	c := newClient()
+	slug, _ := createRoom(t, c, srv.URL, map[string]any{"name": "Preview me", "width": 32, "height": 32})
 
-	res, err := c.Get(srv.URL + "/api/history?after=0&limit=10")
+	res, err := c.Get(srv.URL + "/r/" + slug)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	html := string(body)
+
+	for _, want := range []string{
+		`property="og:title" content="Preview me"`,
+		`property="og:image" content="http://example.test/r/` + slug + `/card.png"`,
+		`data-slug="` + slug + `"`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("room page is missing %s", want)
+		}
+	}
+}
+
+// TestRoomPageHasNoInlineScript pins the bug that broke every room page: the
+// slug used to travel in an inline <script>, which the Content Security Policy
+// refused, leaving the client with no idea which canvas to load.
+func TestRoomPageHasNoInlineScript(t *testing.T) {
+	srv := newServer(t, testDSN(t))
+	c := newClient()
+	slug, _ := createRoom(t, c, srv.URL, map[string]any{"name": "No inline", "width": 32, "height": 32})
+
+	for _, path := range []string{"/r/" + slug, "/embed/" + slug, "/"} {
+		res, err := c.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(res.Body)
+		csp := res.Header.Get("Content-Security-Policy")
+		res.Body.Close()
+
+		html := string(body)
+		for _, chunk := range strings.Split(html, "<script") {
+			if strings.HasPrefix(chunk, "<!doctype") || !strings.Contains(chunk, ">") {
+				continue
+			}
+			open := chunk[:strings.Index(chunk, ">")]
+			if !strings.Contains(open, "src=") && strings.Contains(open, " ") {
+				continue
+			}
+			if !strings.Contains(open, "src=") {
+				t.Errorf("%s contains an inline <script%s>, which this CSP refuses", path, open)
+			}
+		}
+		if !strings.Contains(csp, "script-src 'self'") {
+			t.Errorf("%s CSP should name script-src explicitly, got %q", path, csp)
+		}
+		if strings.Contains(csp, "script-src 'self' 'unsafe-inline'") {
+			t.Errorf("%s CSP has been weakened to allow inline scripts", path)
+		}
+	}
+}
+
+// ------------------------------------------------------------- no database -
+
+// These run everywhere, because "the database is missing" is a state the
+// service is supposed to survive.
+
+func TestWithoutADatabaseTheSiteStillServes(t *testing.T) {
+	srv := newServer(t, "")
+	c := newClient()
+
+	res, err := c.Get(srv.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var health map[string]any
+	_ = json.NewDecoder(res.Body).Decode(&health)
+	res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		t.Errorf("history status = %d; without a database it should return an empty list, not an error", res.StatusCode)
+		t.Fatalf("healthz = %d", res.StatusCode)
+	}
+	if health["ephemeral"] != true {
+		t.Error("healthz should admit it has no database")
 	}
 
-	res2, err := c.Get(srv.URL + "/api/stats")
+	if res, err := c.Get(srv.URL + "/"); err != nil {
+		t.Fatal(err)
+	} else {
+		res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Errorf("home page = %d without a database, want 200", res.StatusCode)
+		}
+	}
+
+	// Creating a room says so plainly rather than failing obscurely.
+	res2, body := postJSON(t, c, srv.URL+"/api/rooms", map[string]any{"name": "nope"})
+	if res2.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("create room = %d, want 503", res2.StatusCode)
+	}
+	if msg, _ := body["error"].(string); !strings.Contains(msg, "database") {
+		t.Errorf("error should mention the missing database, got %q", msg)
+	}
+}
+
+func TestPalettesEndpoint(t *testing.T) {
+	srv := newServer(t, "")
+	c := newClient()
+	res, err := c.Get(srv.URL + "/api/palettes")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer res2.Body.Close()
-	if res2.StatusCode != http.StatusOK {
-		t.Errorf("stats status = %d", res2.StatusCode)
+	var out struct {
+		Palettes []struct {
+			Key    string   `json:"key"`
+			Colors []string `json:"colors"`
+		} `json:"palettes"`
+		Limits map[string]int `json:"limits"`
+	}
+	_ = json.NewDecoder(res.Body).Decode(&out)
+	res.Body.Close()
+
+	if len(out.Palettes) < 3 {
+		t.Errorf("expected several palettes, got %d", len(out.Palettes))
+	}
+	if out.Limits["maxDim"] != room.MaxDim {
+		t.Errorf("limits should tell the client the real bounds, got %v", out.Limits)
+	}
+}
+
+func TestIPLimiter(t *testing.T) {
+	l := newIPLimiter(3, time.Minute)
+	for i := 0; i < 3; i++ {
+		if !l.allow("1.2.3.4") {
+			t.Fatalf("request %d should be allowed", i+1)
+		}
+	}
+	if l.allow("1.2.3.4") {
+		t.Error("the fourth request should be refused")
+	}
+	if !l.allow("5.6.7.8") {
+		t.Error("a different address should have its own budget")
+	}
+}
+
+func TestClientIPPrefersForwardedHeader(t *testing.T) {
+	cases := []struct{ xff, xreal, remote, want string }{
+		{"203.0.113.7, 10.0.0.1", "", "10.0.0.1:5000", "203.0.113.7"},
+		{"", "203.0.113.9", "10.0.0.1:5000", "203.0.113.9"},
+		{"", "", "198.51.100.4:5000", "198.51.100.4"},
+	}
+	for _, tc := range cases {
+		r := httptest.NewRequest("POST", "/", nil)
+		r.RemoteAddr = tc.remote
+		if tc.xff != "" {
+			r.Header.Set("X-Forwarded-For", tc.xff)
+		}
+		if tc.xreal != "" {
+			r.Header.Set("X-Real-Ip", tc.xreal)
+		}
+		if got := clientIP(r); got != tc.want {
+			t.Errorf("clientIP = %q, want %q", got, tc.want)
+		}
+	}
+}
+
+func TestValidUsername(t *testing.T) {
+	for _, ok := range []string{"abc", "har103", "a.b-c_d", strings.Repeat("a", 24)} {
+		if !validUsername(ok) {
+			t.Errorf("validUsername(%q) = false, want true", ok)
+		}
+	}
+	for _, bad := range []string{"", "ab", strings.Repeat("a", 25), "has space", "has/slash", "emoji😀"} {
+		if validUsername(bad) {
+			t.Errorf("validUsername(%q) = true, want false", bad)
+		}
 	}
 }

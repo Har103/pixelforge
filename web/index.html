@@ -2,97 +2,135 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Pixelforge — a canvas everyone shares</title>
-<meta name="description" content="A live, shared pixel canvas. Every placement syncs to every open tab in milliseconds.">
+<meta name="description" content="Make a shared pixel canvas in one click. Send the link. Everyone paints on the same grid, live.">
+<meta property="og:title" content="Pixelforge">
+<meta property="og:description" content="Make a shared pixel canvas in one click. Send the link. Everyone paints on the same grid, live.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="{{OG_URL}}">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="stylesheet" href="/assets/style.css">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%2312141c'/%3E%3Crect x='2' y='2' width='5' height='5' fill='%23ff4d6d'/%3E%3Crect x='9' y='2' width='5' height='5' fill='%23ffd60a'/%3E%3Crect x='2' y='9' width='5' height='5' fill='%233a86ff'/%3E%3Crect x='9' y='9' width='5' height='5' fill='%238ac926'/%3E%3C/svg%3E">
 </head>
-<body>
+<body class="page">
 
-<div id="boot" class="boot">
-  <div class="boot-inner">
-    <div class="boot-grid" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
-    <p id="bootMsg">Loading the canvas…</p>
-  </div>
-</div>
-
-<header class="topbar">
-  <div class="brand">
+<header class="site-head">
+  <a class="brand" href="/">
     <span class="brand-mark" aria-hidden="true"></span>
-    <div>
-      <h1>Pixelforge</h1>
-      <p class="tagline">One canvas. Everyone at once.</p>
-    </div>
-  </div>
-
-  <div class="topbar-stats">
-    <div class="stat">
-      <span class="stat-value" id="statClients">–</span>
-      <span class="stat-label">online</span>
-    </div>
-    <div class="stat">
-      <span class="stat-value" id="statPainted">–</span>
-      <span class="stat-label">painted</span>
-    </div>
-    <div class="stat">
-      <span class="stat-value" id="statPlacements">–</span>
-      <span class="stat-label">placements</span>
-    </div>
-  </div>
-
-  <div class="topbar-right">
-    <span id="ephemeralBadge" class="badge badge-warn" hidden title="No database is attached, so the canvas will reset if the container restarts.">ephemeral</span>
-    <div class="conn" id="conn" title="Realtime transport">
-      <span class="conn-dot" id="connDot"></span>
-      <span class="conn-label" id="connLabel">connecting</span>
-    </div>
-    <button class="ghost" id="btnTransport" title="Switch between WebSocket and Server-Sent Events">ws</button>
-    <button class="ghost" id="btnHelp" title="Keyboard shortcuts and help" aria-label="Help">?</button>
-  </div>
+    <span class="brand-text">Pixelforge</span>
+  </a>
+  <nav class="site-nav">
+    <span id="ephemeralBadge" class="badge badge-warn" hidden title="No database is attached, so rooms cannot be created.">no database</span>
+    <span id="whoami" class="whoami" hidden></span>
+    <button class="ghost" id="btnAccount">sign in</button>
+  </nav>
 </header>
 
-<main class="stage" id="stage">
-  <canvas id="board" aria-label="Shared pixel canvas"></canvas>
-
-  <div class="hud-left">
-    <div class="coords" id="coords">–, –</div>
-    <div class="zoombox">
-      <button class="ghost sq" id="btnZoomOut" aria-label="Zoom out">−</button>
-      <span id="zoomLabel">1×</span>
-      <button class="ghost sq" id="btnZoomIn" aria-label="Zoom in">+</button>
-      <button class="ghost sq" id="btnFit" title="Fit canvas to screen" aria-label="Fit">⤢</button>
+<main>
+  <section class="hero">
+    <h1>One canvas.<br>Everyone at once.</h1>
+    <p class="lede">
+      Make a shared pixel canvas, send the link, and watch it fill up. Every
+      placement lands on every other screen in about a tenth of a second —
+      no accounts, no install, nothing to agree to.
+    </p>
+    <div class="hero-actions">
+      <button class="primary" id="btnStart">Create a canvas</button>
+      <a class="ghost linkish" href="#rooms">Browse live canvases</a>
     </div>
-  </div>
+    <p class="hero-note" id="heroNote"></p>
+  </section>
 
-  <aside class="feed" id="feed" aria-live="polite" aria-label="Live activity">
-    <div class="feed-head">live</div>
-    <ul id="feedList"></ul>
-  </aside>
+  <section class="creator" id="creator" hidden>
+    <div class="creator-card">
+      <h2>New canvas</h2>
 
-  <div class="timelapse" id="timelapse" hidden>
-    <button class="ghost sq" id="btnPlay" aria-label="Play or pause">▶</button>
-    <input type="range" id="scrub" min="0" max="0" value="0" aria-label="Scrub through canvas history">
-    <span class="timelapse-label" id="timelapseLabel">0 / 0</span>
-    <button class="ghost" id="btnExitLapse">exit</button>
-  </div>
+      <label class="field">
+        <span class="field-label">Name</span>
+        <input type="text" id="fName" maxlength="60" placeholder="Friday standup doodle" autocomplete="off">
+      </label>
+
+      <div class="field">
+        <span class="field-label">Size</span>
+        <div class="chips" id="fSizes" role="radiogroup" aria-label="Canvas size"></div>
+      </div>
+
+      <div class="field">
+        <span class="field-label">Palette</span>
+        <div class="palettes" id="fPalettes" role="radiogroup" aria-label="Palette"></div>
+      </div>
+
+      <div class="field">
+        <span class="field-label">Cooldown between pixels</span>
+        <div class="chips" id="fCooldowns" role="radiogroup" aria-label="Cooldown"></div>
+        <p class="hint" id="cooldownHint"></p>
+      </div>
+
+      <label class="check">
+        <input type="checkbox" id="fUnlisted">
+        <span>Unlisted — reachable by link, kept off the browse page</span>
+      </label>
+
+      <div class="creator-actions">
+        <button class="primary" id="btnCreate">Create and open</button>
+        <button class="ghost" id="btnCancel">Cancel</button>
+      </div>
+      <p class="error" id="createError" hidden></p>
+    </div>
+  </section>
+
+  <section class="rooms" id="rooms">
+    <div class="rooms-head">
+      <h2>Live canvases</h2>
+      <button class="ghost sm" id="btnRefresh">refresh</button>
+    </div>
+    <div class="room-grid" id="roomGrid">
+      <div class="room-skeleton"></div>
+      <div class="room-skeleton"></div>
+      <div class="room-skeleton"></div>
+    </div>
+    <p class="empty" id="roomsEmpty" hidden>
+      Nothing here yet. Be the first — make a canvas and send the link to someone.
+    </p>
+  </section>
+
+  <section class="how">
+    <h2>How it holds up</h2>
+    <div class="how-grid">
+      <div class="how-item">
+        <h3>Live, both ways</h3>
+        <p>WebSocket by default with an automatic fallback to Server-Sent
+        Events, so a canvas still syncs on a network that will not carry an
+        upgrade. Updates are batched on a 50&nbsp;ms tick — a paint storm costs
+        a handful of frames a second, not hundreds.</p>
+      </div>
+      <div class="how-item">
+        <h3>It remembers</h3>
+        <p>Every placement is appended to Postgres and the grid is snapshotted,
+        so a restart brings the canvas back exactly as it was. Scrub the whole
+        history, or export it as an animated GIF.</p>
+      </div>
+      <div class="how-item">
+        <h3>You are the moderator</h3>
+        <p>Whoever makes a canvas can pause it, lock a region, clear it, block
+        a painter, or undo everything one person drew — with the pixels
+        underneath restored from the log, not guessed.</p>
+      </div>
+      <div class="how-item">
+        <h3>Nothing under the hood</h3>
+        <p>Go standard library only. The Postgres driver, the WebSocket server,
+        the password hashing and the image encoders are all written here —
+        <code>go.mod</code> has no dependencies at all.</p>
+      </div>
+    </div>
+  </section>
 </main>
 
-<footer class="dock">
-  <div class="cooldown" id="cooldown">
-    <svg viewBox="0 0 40 40" aria-hidden="true">
-      <circle class="cd-track" cx="20" cy="20" r="16"></circle>
-      <circle class="cd-fill" id="cdFill" cx="20" cy="20" r="16"></circle>
-    </svg>
-    <span id="cooldownText">ready</span>
-  </div>
-
-  <div class="palette" id="palette" role="radiogroup" aria-label="Colour palette"></div>
-
-  <div class="dock-actions">
-    <button class="ghost" id="btnLapse" title="Replay how the canvas was built">time-lapse</button>
-    <button class="ghost" id="btnStats" title="Canvas statistics">stats</button>
-  </div>
+<footer class="site-foot">
+  <span>Pixelforge</span>
+  <a href="https://github.com/Har103/pixelforge">source</a>
+  <span id="footStats"></span>
 </footer>
 
 <div class="sheet" id="sheet" hidden>
@@ -104,6 +142,6 @@
 
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
-<script src="/assets/app.js"></script>
+<script src="/assets/home.js"></script>
 </body>
 </html>

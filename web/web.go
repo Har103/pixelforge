@@ -8,7 +8,7 @@ import (
 	"io/fs"
 )
 
-//go:embed index.html assets
+//go:embed *.html assets
 var files embed.FS
 
 // FS returns the embedded front end.

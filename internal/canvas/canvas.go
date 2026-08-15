@@ -9,32 +9,6 @@ import (
 	"time"
 )
 
-// Palette is the fixed set of colours a client may choose from. Index 0 is the
-// canvas background. Keeping the palette server-side means a byte per pixel and
-// no way for a client to smuggle in arbitrary colours.
-var Palette = []string{
-	"#12141c", // 0  void (background)
-	"#ffffff", // 1  white
-	"#b8c1d9", // 2  silver
-	"#6b7899", // 3  slate
-	"#3a4361", // 4  deep slate
-	"#000000", // 5  black
-	"#ff4d6d", // 6  rose
-	"#d90429", // 7  crimson
-	"#8b1e3f", // 8  wine
-	"#ff9f1c", // 9  amber
-	"#ffd60a", // 10 gold
-	"#8ac926", // 11 lime
-	"#2a9d8f", // 12 teal
-	"#00b4d8", // 13 cyan
-	"#3a86ff", // 14 azure
-	"#5f27cd", // 15 indigo
-	"#c77dff", // 16 lilac
-	"#ff70a6", // 17 blossom
-	"#7f5539", // 18 bark
-	"#c98f5f", // 19 sand
-}
-
 // Errors returned by Place.
 var (
 	ErrOutOfBounds = errors.New("canvas: coordinates outside the grid")
@@ -62,6 +36,10 @@ type Canvas struct {
 	seq      int64
 	cooldown time.Duration
 
+	// palette is fixed for the life of the canvas. A cell is one byte because
+	// of it, and a client cannot introduce a colour that is not in it.
+	palette []string
+
 	// lastPlace records the most recent placement per user id. It is pruned
 	// lazily so an unbounded stream of one-shot visitors cannot grow it without
 	// limit.
@@ -69,20 +47,33 @@ type Canvas struct {
 	lastPrune time.Time
 }
 
-// New returns an empty canvas filled with palette index 0.
-func New(width, height int, cooldown time.Duration) *Canvas {
+// New returns an empty canvas filled with palette index 0. A nil or empty
+// palette falls back to Classic rather than producing a canvas nobody can paint.
+func New(width, height int, palette []string, cooldown time.Duration) *Canvas {
 	if width <= 0 || height <= 0 {
 		panic("canvas: dimensions must be positive")
+	}
+	if len(palette) == 0 {
+		palette = Palette
+	}
+	if len(palette) > 256 {
+		// One byte per cell is the whole storage design; refusing here is
+		// better than silently truncating a room's palette.
+		panic("canvas: palette cannot exceed 256 colours")
 	}
 	return &Canvas{
 		width:     width,
 		height:    height,
 		pixels:    make([]byte, width*height),
 		cooldown:  cooldown,
+		palette:   palette,
 		lastPlace: make(map[string]time.Time),
 		lastPrune: time.Now(),
 	}
 }
+
+// Palette returns the colours this canvas accepts.
+func (c *Canvas) Palette() []string { return c.palette }
 
 // Width returns the grid width in pixels.
 func (c *Canvas) Width() int { return c.width }
@@ -126,7 +117,7 @@ func (c *Canvas) Load(pixels []byte, seq int64) error {
 // Apply writes a pixel with no rule checks and without advancing the sequence
 // past the supplied value. It exists for replaying history at boot.
 func (c *Canvas) Apply(x, y int, colour uint8, seq int64) {
-	if x < 0 || y < 0 || x >= c.width || y >= c.height || int(colour) >= len(Palette) {
+	if x < 0 || y < 0 || x >= c.width || y >= c.height || int(colour) >= len(c.palette) {
 		return
 	}
 	c.mu.Lock()
@@ -156,7 +147,7 @@ func (c *Canvas) Place(x, y int, colour uint8, uid string, now time.Time) (Pixel
 	if x < 0 || y < 0 || x >= c.width || y >= c.height {
 		return Pixel{}, ErrOutOfBounds
 	}
-	if int(colour) >= len(Palette) {
+	if int(colour) >= len(c.palette) {
 		return Pixel{}, ErrBadColour
 	}
 
@@ -222,7 +213,7 @@ type Stats struct {
 func (c *Canvas) Stats() Stats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	counts := make(map[string]int, len(Palette))
+	counts := make(map[string]int, len(c.palette))
 	painted := 0
 	var hist [256]int
 	for _, p := range c.pixels {
@@ -232,8 +223,8 @@ func (c *Canvas) Stats() Stats {
 		}
 	}
 	for i, n := range hist {
-		if n > 0 && i < len(Palette) {
-			counts[Palette[i]] = n
+		if n > 0 && i < len(c.palette) {
+			counts[c.palette[i]] = n
 		}
 	}
 	return Stats{
