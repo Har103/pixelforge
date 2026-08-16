@@ -80,11 +80,20 @@ var palettes = map[string]PaletteInfo{
 var Palette = palettes[DefaultPaletteKey].Colors
 
 // PaletteFor returns the colours for a palette key, falling back to Classic.
+// The returned slice is a copy. Handing out the package's own backing array
+// would mean one room writing through it - a caller sorting it, or normalising
+// a colour in place - silently changing the palette of every room created
+// afterwards, including rooms already on disk whose stored key says otherwise.
+// A palette is a fixed property of a canvas, and the cheapest way to keep that
+// true is for nobody to share one.
 func PaletteFor(key string) []string {
-	if p, ok := palettes[key]; ok {
-		return p.Colors
+	p, ok := palettes[key]
+	if !ok {
+		p = palettes[DefaultPaletteKey]
 	}
-	return palettes[DefaultPaletteKey].Colors
+	out := make([]string, len(p.Colors))
+	copy(out, p.Colors)
+	return out
 }
 
 // PaletteExists reports whether a key names a real palette.
@@ -102,18 +111,24 @@ func NormalisePaletteKey(key string) string {
 }
 
 // Palettes lists every palette, ordered so the UI is stable across restarts.
+// Each entry carries its own copy of the colours, for the reason PaletteFor
+// explains: a PaletteInfo handed to a template or a JSON encoder still holds a
+// slice, and a slice is a window onto the original.
 func Palettes() []PaletteInfo {
 	out := make([]PaletteInfo, 0, len(palettes))
 	for _, p := range palettes {
+		p.Colors = append([]string(nil), p.Colors...)
 		out = append(out, p)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		// Classic first, then by name, so the default is always the first card.
-		if out[i].Key == DefaultPaletteKey {
-			return true
-		}
-		if out[j].Key == DefaultPaletteKey {
-			return false
+		// Comparing both sides keeps this a strict weak ordering: returning true
+		// whenever the left is the default would also return true when both are,
+		// which sort.Slice is entitled to treat as a contradiction.
+		iDefault := out[i].Key == DefaultPaletteKey
+		jDefault := out[j].Key == DefaultPaletteKey
+		if iDefault != jDefault {
+			return iDefault
 		}
 		return out[i].Name < out[j].Name
 	})

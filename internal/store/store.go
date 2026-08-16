@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +22,12 @@ var ErrSlugTaken = errors.New("store: slug already in use")
 
 // ErrUsernameTaken is returned when a registration collides.
 var ErrUsernameTaken = errors.New("store: username already registered")
+
+// ErrAlreadyClaimed is returned when a room is claimed by an account and it
+// already belongs to one. It is a distinct error rather than a silent no-op so
+// the caller can say "this canvas already has an owner" instead of reporting a
+// success that changed nothing.
+var ErrAlreadyClaimed = errors.New("store: this room already belongs to an account")
 
 // Store is the only thing in the program that writes SQL.
 type Store struct {
@@ -144,6 +151,27 @@ func scanRoom(row [][]byte) (Room, error) {
 	}, nil
 }
 
+// scanRoomSummary reads a room row that carries a placement count in a
+// fourteenth column.
+//
+// It exists because both callers of that query used to scan the room with
+// scanRoom - whose guard only requires thirteen columns - and then reach
+// straight for row[13]. A row with exactly thirteen columns passed the check
+// and panicked on the very next line, taking the request handler with it. One
+// function that knows it needs fourteen cannot drift apart from the guard that
+// proves it has them.
+func scanRoomSummary(row [][]byte) (RoomSummary, error) {
+	if len(row) < 14 {
+		return RoomSummary{}, fmt.Errorf("store: room summary row has %d columns, want 14", len(row))
+	}
+	r, err := scanRoom(row)
+	if err != nil {
+		return RoomSummary{}, err
+	}
+	n, _ := pg.Int64(row[13])
+	return RoomSummary{Room: r, Placements: n}, nil
+}
+
 // CreateRoom inserts a room and returns it with its assigned id.
 func (s *Store) CreateRoom(ctx context.Context, r Room) (Room, error) {
 	if s.Ephemeral() {
@@ -243,12 +271,11 @@ func (s *Store) ListRooms(ctx context.Context, limit int) ([]RoomSummary, error)
 	}
 	out := make([]RoomSummary, 0, len(res.Rows))
 	for _, row := range res.Rows {
-		r, err := scanRoom(row)
+		summary, err := scanRoomSummary(row)
 		if err != nil {
 			return nil, err
 		}
-		n, _ := pg.Int64(row[13])
-		out = append(out, RoomSummary{Room: r, Placements: n})
+		out = append(out, summary)
 	}
 	return out, nil
 }
@@ -273,24 +300,38 @@ func (s *Store) RoomsForUser(ctx context.Context, userID int64) ([]RoomSummary, 
 	}
 	out := make([]RoomSummary, 0, len(res.Rows))
 	for _, row := range res.Rows {
-		r, err := scanRoom(row)
+		summary, err := scanRoomSummary(row)
 		if err != nil {
 			return nil, err
 		}
-		n, _ := pg.Int64(row[13])
-		out = append(out, RoomSummary{Room: r, Placements: n})
+		out = append(out, summary)
 	}
 	return out, nil
 }
 
 // ClaimRoom attaches an unowned room to an account, so a moderator key can be
 // upgraded into something that survives losing the cookie.
+// It attaches an *unowned* room, and the "unowned" is load-bearing. Without it
+// the moderator key becomes a transfer of ownership: anybody who has ever been
+// given a recovery link - which is designed to be saved and shared - could
+// reassign the room to their own account and lock the original owner out of
+// something they made. A room that already has an owner is left alone and the
+// caller is told, so the interface can say so instead of reporting a success
+// that did nothing.
 func (s *Store) ClaimRoom(ctx context.Context, roomID, userID int64) error {
 	if s.Ephemeral() {
 		return nil
 	}
-	_, err := s.pool.Query(ctx, `update rooms set owner_user = $2 where id = $1`, roomID, userID)
-	return err
+	res, err := s.pool.Query(ctx,
+		`update rooms set owner_user = $2 where id = $1 and owner_user is null returning id`,
+		roomID, userID)
+	if err != nil {
+		return fmt.Errorf("store: claiming room: %w", err)
+	}
+	if len(res.Rows) == 0 {
+		return ErrAlreadyClaimed
+	}
+	return nil
 }
 
 // ------------------------------------------------------------ snapshots -----
@@ -396,15 +437,30 @@ func (s *Store) ReplayAfter(ctx context.Context, roomID, after int64,
 	if s.Ephemeral() {
 		return 0, nil
 	}
+	// Paged on (room_seq, id) rather than room_seq alone. Sequence numbers are
+	// handed out by the in-memory canvas, so nothing in the database stops two
+	// rows sharing one - two replicas serving the same room would produce that
+	// routinely, and the pre-rooms fold-forward could too. With a cursor of
+	// "room_seq > n" the duplicate that happened to land at the end of a page
+	// took its twin with it, and the pixel simply never appeared after a
+	// restart. Ordering by the primary key as well makes the position in the
+	// stream unique whether or not the sequence is.
+	//
+	// The id half of the cursor starts at its maximum so that the first page is
+	// exactly the old condition, room_seq > after, and nothing at the snapshot's
+	// own sequence is replayed on top of it. Only the pages after the first use
+	// the id to break a tie.
 	const page = 20000
-	total, cursor := 0, after
+	total := 0
+	cursorSeq, cursorID := after, int64(math.MaxInt64)
 	for {
 		res, err := s.pool.Query(ctx, `
-			select room_seq, x, y, color
+			select room_seq, x, y, color, id
 			  from room_placements
-			 where room_id = $1 and room_seq > $2 and not undone
-			 order by room_seq asc
-			 limit $3`, roomID, cursor, page)
+			 where room_id = $1 and not undone
+			   and (room_seq > $2 or (room_seq = $2 and id > $3))
+			 order by room_seq asc, id asc
+			 limit $4`, roomID, cursorSeq, cursorID, page)
 		if err != nil {
 			return total, fmt.Errorf("store: replaying placements: %w", err)
 		}
@@ -412,12 +468,16 @@ func (s *Store) ReplayAfter(ctx context.Context, roomID, after int64,
 			return total, nil
 		}
 		for _, r := range res.Rows {
+			if len(r) < 5 {
+				return total, fmt.Errorf("store: placement row has %d columns, want 5", len(r))
+			}
 			seq, _ := pg.Int64(r[0])
 			x, _ := pg.Int(r[1])
 			y, _ := pg.Int(r[2])
 			c, _ := pg.Int(r[3])
+			id, _ := pg.Int64(r[4])
 			fn(seq, x, y, uint8(c))
-			cursor = seq
+			cursorSeq, cursorID = seq, id
 		}
 		total += len(res.Rows)
 		if len(res.Rows) < page {
@@ -553,6 +613,84 @@ func (s *Store) Bans(ctx context.Context, roomID int64) (map[string]bool, error)
 	return out, nil
 }
 
+// LockRect is one frozen rectangle, in the shape the locks table stores.
+type LockRect struct {
+	X1, Y1, X2, Y2 int
+}
+
+// Locks loads a room's frozen rectangles.
+//
+// The table has existed since the first schema and nothing read or wrote it,
+// so freezing a region was an in-memory decision only: the room was evicted
+// twenty minutes after everyone left, reloaded without its locks, and the area
+// a moderator had deliberately protected quietly became paintable again with
+// nothing on screen to say it had changed.
+func (s *Store) Locks(ctx context.Context, roomID int64) ([]LockRect, error) {
+	if s.Ephemeral() {
+		return nil, nil
+	}
+	res, err := s.pool.Query(ctx,
+		`select x1, y1, x2, y2 from locks where room_id = $1 order by id`, roomID)
+	if err != nil {
+		return nil, fmt.Errorf("store: loading locks: %w", err)
+	}
+	out := make([]LockRect, 0, len(res.Rows))
+	for _, r := range res.Rows {
+		if len(r) < 4 {
+			return nil, fmt.Errorf("store: lock row has %d columns, want 4", len(r))
+		}
+		x1, _ := pg.Int(r[0])
+		y1, _ := pg.Int(r[1])
+		x2, _ := pg.Int(r[2])
+		y2, _ := pg.Int(r[3])
+		out = append(out, LockRect{X1: x1, Y1: y1, X2: x2, Y2: y2})
+	}
+	return out, nil
+}
+
+// SetLocks replaces a room's frozen rectangles wholesale, which is how the
+// moderation UI thinks about them: it sends the set it wants to exist.
+//
+// Delete and insert rather than a diff, in a single statement so that a reader
+// can never observe the moment where the old set is gone and the new one has
+// not arrived - which would be a window in which a protected area is paintable.
+// The delete rides in a data-modifying CTE precisely because it has to be one
+// statement: the extended query protocol this driver uses for anything carrying
+// parameters will not accept two.
+func (s *Store) SetLocks(ctx context.Context, roomID int64, locks []LockRect) error {
+	if s.Ephemeral() {
+		return nil
+	}
+	if len(locks) == 0 {
+		if _, err := s.pool.Query(ctx, `delete from locks where room_id = $1`, roomID); err != nil {
+			return fmt.Errorf("store: clearing locks: %w", err)
+		}
+		return nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(`with cleared as (delete from locks where room_id = $1)
+		insert into locks (room_id, x1, y1, x2, y2) values `)
+	args := make([]any, 0, 1+len(locks)*4)
+	args = append(args, roomID)
+	for i, l := range locks {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		base := i*4 + 1
+		sb.WriteString("($1,$" + strconv.Itoa(base+1) +
+			",$" + strconv.Itoa(base+2) +
+			",$" + strconv.Itoa(base+3) +
+			",$" + strconv.Itoa(base+4) + ")")
+		args = append(args, l.X1, l.Y1, l.X2, l.Y2)
+	}
+
+	if _, err := s.pool.Query(ctx, sb.String(), args...); err != nil {
+		return fmt.Errorf("store: saving locks: %w", err)
+	}
+	return nil
+}
+
 // Ban blocks a painter from a room.
 func (s *Store) Ban(ctx context.Context, roomID int64, uid string) error {
 	if s.Ephemeral() {
@@ -598,6 +736,13 @@ func (s *Store) CreateUser(ctx context.Context, username, pwHash string) (User, 
 			return User{}, ErrUsernameTaken
 		}
 		return User{}, fmt.Errorf("store: creating user: %w", err)
+	}
+	// "insert ... returning" always yields a row when it succeeds, so this is
+	// unreachable today. It is here because the alternative to an error is an
+	// index out of range, and an assumption about someone else's software is a
+	// poor thing to stake a panic on.
+	if len(res.Rows) == 0 {
+		return User{}, fmt.Errorf("store: creating user: insert returned no row")
 	}
 	return scanUser(res.Rows[0])
 }

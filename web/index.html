@@ -15,6 +15,8 @@
 </head>
 <body class="page">
 
+<a class="skip-link" href="#main">Skip to main content</a>
+
 <header class="site-head">
   <a class="brand" href="/">
     <span class="brand-mark" aria-hidden="true"></span>
@@ -27,7 +29,7 @@
   </nav>
 </header>
 
-<main>
+<main id="main" tabindex="-1">
   <section class="hero">
     <h1>One canvas.<br>Everyone at once.</h1>
     <p class="lede">
@@ -36,34 +38,39 @@
       no accounts, no install, nothing to agree to.
     </p>
     <div class="hero-actions">
-      <button class="primary" id="btnStart">Create a canvas</button>
+      <button class="primary" id="btnStart" aria-expanded="false" aria-controls="creator">Create a canvas</button>
       <a class="ghost linkish" href="#rooms">Browse live canvases</a>
     </div>
     <p class="hero-note" id="heroNote"></p>
   </section>
 
-  <section class="creator" id="creator" hidden>
+  <section class="creator" id="creator" aria-labelledby="creatorTitle" hidden>
     <div class="creator-card">
-      <h2>New canvas</h2>
+      <h2 id="creatorTitle">New canvas</h2>
 
       <label class="field">
         <span class="field-label">Name</span>
         <input type="text" id="fName" maxlength="60" placeholder="Friday standup doodle" autocomplete="off">
       </label>
 
+      <!-- These three are real radio groups, so each option carries
+           aria-checked and only the chosen one is a tab stop; the arrows move
+           between them. Before, they were buttons wearing role="radio" with no
+           state on them at all, which announces every option as unchecked. -->
       <div class="field">
-        <span class="field-label">Size</span>
-        <div class="chips" id="fSizes" role="radiogroup" aria-label="Canvas size"></div>
+        <span class="field-label" id="fSizesLabel">Size</span>
+        <div class="chips" id="fSizes" role="radiogroup" aria-labelledby="fSizesLabel"></div>
       </div>
 
       <div class="field">
-        <span class="field-label">Palette</span>
-        <div class="palettes" id="fPalettes" role="radiogroup" aria-label="Palette"></div>
+        <span class="field-label" id="fPalettesLabel">Palette</span>
+        <div class="palettes" id="fPalettes" role="radiogroup" aria-labelledby="fPalettesLabel"></div>
       </div>
 
       <div class="field">
-        <span class="field-label">Cooldown between pixels</span>
-        <div class="chips" id="fCooldowns" role="radiogroup" aria-label="Cooldown"></div>
+        <span class="field-label" id="fCooldownsLabel">Cooldown between pixels</span>
+        <div class="chips" id="fCooldowns" role="radiogroup"
+             aria-labelledby="fCooldownsLabel" aria-describedby="cooldownHint"></div>
         <p class="hint" id="cooldownHint"></p>
       </div>
 
@@ -76,27 +83,31 @@
         <button class="primary" id="btnCreate">Create and open</button>
         <button class="ghost" id="btnCancel">Cancel</button>
       </div>
-      <p class="error" id="createError" hidden></p>
+      <!-- role=alert, because the failure appears below a button somebody has
+           just pressed and nothing else on the page moves to tell them. -->
+      <p class="error" id="createError" role="alert" hidden></p>
     </div>
   </section>
 
-  <section class="rooms" id="rooms">
+  <section class="rooms" id="rooms" aria-labelledby="roomsTitle">
     <div class="rooms-head">
-      <h2>Live canvases</h2>
-      <button class="ghost sm" id="btnRefresh">refresh</button>
+      <h2 id="roomsTitle">Live canvases</h2>
+      <button class="ghost sm" id="btnRefresh" aria-label="Refresh the list of canvases">refresh</button>
     </div>
-    <div class="room-grid" id="roomGrid">
-      <div class="room-skeleton"></div>
-      <div class="room-skeleton"></div>
-      <div class="room-skeleton"></div>
+    <!-- The skeletons are the shape of content that has not arrived; there is
+         nothing in them to read, and aria-busy says the list is mid-flight. -->
+    <div class="room-grid" id="roomGrid" aria-busy="true">
+      <div class="room-skeleton" aria-hidden="true"></div>
+      <div class="room-skeleton" aria-hidden="true"></div>
+      <div class="room-skeleton" aria-hidden="true"></div>
     </div>
     <p class="empty" id="roomsEmpty" hidden>
       Nothing here yet. Be the first — make a canvas and send the link to someone.
     </p>
   </section>
 
-  <section class="how">
-    <h2>How it holds up</h2>
+  <section class="how" aria-labelledby="howTitle">
+    <h2 id="howTitle">How it holds up</h2>
     <div class="how-grid">
       <div class="how-item">
         <h3>Live, both ways</h3>
@@ -134,8 +145,9 @@
 </footer>
 
 <div class="sheet" id="sheet" hidden>
-  <div class="sheet-inner">
-    <button class="sheet-close ghost sq" id="btnSheetClose" aria-label="Close">×</button>
+  <div class="sheet-inner" id="sheetInner" role="dialog" aria-modal="true"
+       aria-labelledby="sheetTitle" tabindex="-1">
+    <button class="sheet-close ghost sq" id="btnSheetClose" aria-label="Close this dialog">×</button>
     <div id="sheetBody"></div>
   </div>
 </div>

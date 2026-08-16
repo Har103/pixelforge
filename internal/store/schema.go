@@ -92,6 +92,18 @@ create index if not exists locks_room_idx on locks (room_id);
 // The guard is the existence of the old tables plus an empty rooms table: if
 // someone has already created rooms, there is nothing to fold in and running
 // this would invent a duplicate.
+//
+// Both old tables are looked up unqualified, through the search path, and both
+// have to be there. Naming one schema explicitly was wrong twice over. A
+// deployment that pins a schema of its own - which this driver supports, since
+// any unrecognised DSN keyword is passed through as a startup parameter, and
+// which managed providers hand out routinely - creates its tables there while
+// the guard went looking in public, so the fold silently did nothing and every
+// pixel of the old canvas stayed invisible to the new one. In the other
+// direction, an unrelated table called "placements" sitting in public was
+// enough to convince the guard there was a v1 canvas to fold, and the block
+// then failed on the "snapshots" it reads two lines later - which fails
+// Migrate, which fails the boot, on every replica, forever.
 const migrateV1 = `
 do $$
 declare
@@ -99,7 +111,8 @@ declare
     v_has_old  boolean;
     v_has_new  boolean;
 begin
-    select to_regclass('public.placements') is not null into v_has_old;
+    select to_regclass('placements') is not null
+       and to_regclass('snapshots')  is not null into v_has_old;
     select exists (select 1 from rooms) into v_has_new;
 
     if not v_has_old or v_has_new then

@@ -38,8 +38,8 @@ func drain(s *Subscriber, wg *sync.WaitGroup) {
 // the process with it.
 //
 // Every broadcaster the server has is represented here, because they all reach
-// the same code: the coalescing loop flushing pixels, a request goroutine
-// announcing presence, and the cursor tick.
+// the same code: the coalescing loop flushing pixels and announcing presence, a
+// request goroutine sending a control message, and the cursor tick.
 func TestBroadcastSurvivesClientsLeavingMidSend(t *testing.T) {
 	h := testHub(t)
 	done := make(chan struct{})
@@ -146,8 +146,8 @@ func TestSubscribersGetTheFormTheirTransportCanCarry(t *testing.T) {
 	}
 }
 
-// nextFrame takes the first pixel frame off a subscriber, skipping the presence
-// announcements that subscribing itself produces.
+// nextFrame takes the first pixel frame off a subscriber, skipping any presence
+// announcement the loop has made in the meantime.
 func nextFrame(t *testing.T, s *Subscriber) (Frame, bool) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
@@ -251,9 +251,10 @@ func TestUnsubscribingTwiceIsHarmless(t *testing.T) {
 		t.Errorf("%d clients remain after unsubscribing the only one", n)
 	}
 
-	// Drain whatever was buffered - subscribing announces presence, so the
-	// channel is not empty - and then confirm it really is closed. A channel
-	// left open leaves the writer goroutine parked on it forever.
+	// Drain whatever was buffered before confirming the channel really is
+	// closed, because a receive on a channel that still holds frames returns one
+	// of them rather than the closed signal. A channel left open leaves the
+	// writer goroutine parked on it forever.
 	closed := false
 	for i := 0; i < h.bufferSize+2; i++ {
 		if _, ok := <-s.C; !ok {
@@ -263,5 +264,239 @@ func TestUnsubscribingTwiceIsHarmless(t *testing.T) {
 	}
 	if !closed {
 		t.Error("the channel is still open after Unsubscribe, so the writer goroutine never returns")
+	}
+}
+
+// presenceCounts takes whatever is already sitting in a subscriber's channel and
+// returns the headcount out of each presence frame, so a test can talk about
+// what one client was shown rather than about what was broadcast. Nothing here
+// blocks: everything it reads was put there by the test's own goroutine.
+func presenceCounts(t *testing.T, s *Subscriber) []int {
+	t.Helper()
+	var out []int
+	for {
+		select {
+		case f, ok := <-s.C:
+			if !ok {
+				return out
+			}
+			if n, isPresence := presenceOf(t, f); isPresence {
+				out = append(out, n)
+			}
+		default:
+			return out
+		}
+	}
+}
+
+// awaitPresence blocks until a presence frame arrives or the deadline passes.
+// The arrival of the frame is the event being waited for, so this is a
+// synchronisation point and not a sleep standing in for one.
+func awaitPresence(t *testing.T, s *Subscriber, within time.Duration) (int, bool) {
+	t.Helper()
+	deadline := time.After(within)
+	for {
+		select {
+		case f, ok := <-s.C:
+			if !ok {
+				return 0, false
+			}
+			if n, isPresence := presenceOf(t, f); isPresence {
+				return n, true
+			}
+		case <-deadline:
+			return 0, false
+		}
+	}
+}
+
+func presenceOf(t *testing.T, f Frame) (int, bool) {
+	t.Helper()
+	if f.Binary {
+		return 0, false
+	}
+	var msg struct {
+		T string `json:"t"`
+		N int    `json:"n"`
+	}
+	if err := json.Unmarshal(f.Data, &msg); err != nil || msg.T != "presence" {
+		return 0, false
+	}
+	return msg.N, true
+}
+
+// TestAJoinStormDoesNotCostAFramePerJoiner is the one that matters. Presence
+// used to be announced by whoever joined or left, which meant one arrival cost a
+// frame to every client already in the room: filling a room with N people cost
+// N^2/2 frames, and the load test watched frames per joiner climb 14, 27, 52,
+// 102 as the room grew.
+//
+// The frame count is not the injury, though. Those frames arrive faster than a
+// client can be scheduled to read them, so its 32-frame buffer fills and
+// broadcast disconnects it as too slow - and that disconnection is itself
+// another presence change, which broadcasts another N frames. 500 watchers
+// joining an idle room produced thirteen thousand disconnections. People were
+// being kicked off the canvas by other people arriving.
+//
+// Nobody reads their channel here, deliberately. A client that has connected but
+// has not yet been scheduled is not a slow client, it is an ordinary one.
+func TestAJoinStormDoesNotCostAFramePerJoiner(t *testing.T) {
+	h := testHub(t)
+	const joiners = 200
+
+	subs := make([]*Subscriber, 0, joiners)
+	for i := 0; i < joiners; i++ {
+		subs = append(subs, h.Subscribe("ws"))
+	}
+
+	clients, delivered, dropped := h.Stats()
+	if dropped != 0 {
+		t.Errorf("%d frames could not be delivered while %d clients joined an idle room; "+
+			"each one is a client the hub then disconnects as too slow, so people are "+
+			"being kicked off the canvas by other people arriving", dropped, joiners)
+	}
+	if total := delivered + dropped; total > joiners {
+		t.Errorf("%d joins produced %d frames (%.1f per joiner); a join is broadcasting to "+
+			"everyone already in the room, which makes filling a room quadratic",
+			joiners, total, float64(total)/float64(joiners))
+	}
+	if clients != joiners {
+		t.Errorf("the hub holds %d subscribers after %d joins", clients, joiners)
+	}
+
+	// Bounded is only half of it: the number still has to arrive. Once the loop
+	// has had its chance to act, every one of those clients must have been told
+	// how many people are in the room.
+	h.presenceStep(time.Now())
+	for i, s := range subs {
+		got := presenceCounts(t, s)
+		if len(got) == 0 {
+			t.Fatalf("client %d was never told how many people are in the room, so its "+
+				"headcount stays at whatever it saw when it connected", i)
+		}
+		if last := got[len(got)-1]; last != joiners {
+			t.Fatalf("client %d was last shown %d people in a room of %d", i, last, joiners)
+		}
+	}
+}
+
+// TestPresenceIsThrottledAndStillTrailsTheBurst pins the throttle from both
+// ends. Rate limiting presence is easy to get wrong in the direction that
+// matters: the old guard read "announce unless it is too soon and the count has
+// not changed", and since a join always changes the count it never held anything
+// back at all.
+//
+// Times are passed in rather than slept through, so this says exactly what the
+// throttle does without waiting for a real second to go by.
+func TestPresenceIsThrottledAndStillTrailsTheBurst(t *testing.T) {
+	h := testHub(t)
+	h.presenceEvery = time.Second
+	watcher := h.Subscribe("sse")
+
+	t0 := time.Now()
+	if !h.presenceStep(t0) {
+		t.Fatal("presenceStep sat on the first change to a room that had been quiet; a " +
+			"throttle that delays the leading edge makes every join feel laggy")
+	}
+	h.Subscribe("ws")
+	if h.presenceStep(t0.Add(200 * time.Millisecond)) {
+		t.Error("presenceStep announced again 200ms after the last one, so a burst of joins " +
+			"is not being held back and the room still pays a frame per arrival")
+	}
+	if !h.presenceStep(t0.Add(time.Second)) {
+		t.Error("presenceStep never announced the change it had held back, so the count " +
+			"every client is showing stays wrong until somebody else happens to join")
+	}
+	if h.presenceStep(t0.Add(10 * time.Second)) {
+		t.Error("presenceStep announced although nobody had joined or left; an idle room " +
+			"must cost nothing")
+	}
+
+	if got, want := presenceCounts(t, watcher), []int{1, 2}; !sameInts(got, want) {
+		t.Errorf("the watcher was shown %v, want %v: one frame for the room it joined and "+
+			"one for the person who arrived after it", got, want)
+	}
+}
+
+func sameInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestPresenceConvergesOnTheCountTheRoomSettledAt is the other half of the
+// bargain the throttle makes: collapsing a burst is only acceptable if what
+// comes out the far side is the number that is true at the end of it. A count
+// that is a second stale is fine; a count that is permanently wrong is not.
+func TestPresenceConvergesOnTheCountTheRoomSettledAt(t *testing.T) {
+	h := testHub(t)
+	h.presenceEvery = time.Second
+	watcher := h.Subscribe("sse")
+
+	t0 := time.Now()
+	h.presenceStep(t0)
+	presenceCounts(t, watcher) // the watcher's own arrival, already accounted for
+
+	// Five people arrive and three of them leave again, all inside one interval:
+	// a lobby emptying into a room, or a proxy dropping a handful of sockets.
+	joined := make([]*Subscriber, 0, 5)
+	for i := 0; i < 5; i++ {
+		joined = append(joined, h.Subscribe("ws"))
+	}
+	for _, s := range joined[:3] {
+		h.Unsubscribe(s)
+	}
+
+	h.presenceStep(t0.Add(time.Second))
+
+	got := presenceCounts(t, watcher)
+	if len(got) != 1 {
+		t.Errorf("the watcher was shown %v: eight joins and leaves must collapse into the "+
+			"one figure the room settled at, not be replayed one frame at a time", got)
+	}
+	if len(got) == 0 || got[len(got)-1] != h.Count() {
+		t.Errorf("the watcher was last shown %v for a room of %d, so its headcount is "+
+			"permanently wrong", got, h.Count())
+	}
+}
+
+// TestRunAnnouncesPresenceSoNobodyElseHasTo pins where the work belongs. The
+// loop already owns coalescing placements, and presence is the same problem: a
+// number that changes far faster than anybody needs to be told about it. Leaving
+// it to the joining goroutine is what made it quadratic.
+func TestRunAnnouncesPresenceSoNobodyElseHasTo(t *testing.T) {
+	h := testHub(t)
+	h.presenceEvery = 5 * time.Millisecond
+	done := make(chan struct{})
+	defer close(done)
+	go h.Run(done)
+
+	watcher := h.Subscribe("sse")
+	n, ok := awaitPresence(t, watcher, 10*time.Second)
+	if !ok {
+		t.Fatal("no presence frame arrived although a client joined; nothing announces " +
+			"presence at all, so the number on the page never moves again")
+	}
+	if n != 1 {
+		t.Errorf("the first announcement said %d people, want 1", n)
+	}
+
+	h.Subscribe("ws")
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		n, ok = awaitPresence(t, watcher, time.Until(deadline))
+		if !ok {
+			t.Fatalf("the room went to 2 people and the watcher was never told; it was "+
+				"last shown %d", n)
+		}
+		if n == 2 {
+			break
+		}
 	}
 }

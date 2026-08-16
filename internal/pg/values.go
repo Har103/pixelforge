@@ -149,6 +149,11 @@ func Time(v []byte) (time.Time, error) {
 	layouts := []string{
 		"2006-01-02 15:04:05.999999-07",
 		"2006-01-02 15:04:05.999999-07:00",
+		// Before a region adopted a standard zone PostgreSQL prints its local
+		// mean time, and that offset has seconds in it: 1880 in New York comes
+		// back as "-04:56:02". Without this layout any timestamp older than
+		// standardisation fails to parse.
+		"2006-01-02 15:04:05.999999-07:00:00",
 		"2006-01-02 15:04:05.999999",
 		"2006-01-02 15:04:05-07",
 		"2006-01-02",

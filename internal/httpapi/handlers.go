@@ -36,8 +36,19 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request, rm *room.Room)
 
 	// Writer: drains the hub, and pings so an idle proxy does not quietly drop
 	// a connection that is merely waiting for someone else to paint.
+	//
+	// When it returns because the hub closed the subscription - the room was
+	// released, or the server is shutting down - it expires the read deadline on
+	// the way out. Without that the reader below stays blocked on a socket
+	// nothing will ever write to again: no pixels, no presence, not even a ping,
+	// and no signal to reconnect. A client that keeps sending cursor moves would
+	// go on resetting that deadline and could hold the dead connection open
+	// indefinitely.
 	go func() {
-		defer close(done)
+		defer func() {
+			_ = conn.SetReadDeadline(time.Now())
+			close(done)
+		}()
 		ping := time.NewTicker(25 * time.Second)
 		defer ping.Stop()
 		for {
@@ -147,6 +158,15 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request, rm *room.Room
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
+	// Subscribed before the greeting is composed, so the count it carries
+	// includes this client. Sent the other way round it was always one short,
+	// and stayed wrong until the next presence broadcast - which now only
+	// happens on a throttle, so "one short" could persist for a second on the
+	// one screen where it is most obviously wrong.
+	sub := rm.Hub.Subscribe("sse")
+	defer rm.Hub.Unsubscribe(sub)
+	rm.Touch()
+
 	fmt.Fprint(w, "retry: 2000\n\n")
 	// The painter id travels in the greeting on this transport too. A client
 	// that does not know who it is cannot tell its own cursor from a stranger's
@@ -157,10 +177,6 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request, rm *room.Room
 	})
 	fmt.Fprintf(w, "data: %s\n\n", hello)
 	flusher.Flush()
-
-	sub := rm.Hub.Subscribe("sse")
-	defer rm.Hub.Unsubscribe(sub)
-	rm.Touch()
 
 	keepalive := time.NewTicker(20 * time.Second)
 	defer keepalive.Stop()
@@ -397,7 +413,20 @@ func (s *Server) handleModLocks(w http.ResponseWriter, r *http.Request, rm *room
 		}
 		clean = append(clean, l)
 	}
-	rm.SetLocks(clean)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	if err := rm.SetLocks(ctx, clean); err != nil {
+		// The locks are already applied in memory and already broadcast, so the
+		// moderator's intent is in force right now. What failed is making it
+		// outlast the room, and telling them that is better than a green tick
+		// on something that will quietly revert.
+		s.Log.Error("saving room locks", "room", rm.Slug(), "err", err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "locks applied, but they could not be saved and will not survive a restart",
+			"locks": rm.Locks(),
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "locks": rm.Locks()})
 }
 
@@ -409,7 +438,18 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request, rm *room.Ro
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	if err := s.Store.ClaimRoom(ctx, rm.Meta.ID, uid); err != nil {
+	switch err := s.Store.ClaimRoom(ctx, rm.Meta.ID, uid); {
+	case errors.Is(err, store.ErrAlreadyClaimed):
+		// Holding the moderator key is not the same as owning the canvas. The
+		// recovery link is meant to be saved and passed around, so letting it
+		// reassign a room would mean anybody who ever had it could take the
+		// room away from the account that owns it.
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": "this canvas already belongs to an account",
+		})
+		return
+	case err != nil:
+		s.Log.Error("claiming room", "room", rm.Slug(), "err", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "could not claim"})
 		return
 	}

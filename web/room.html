@@ -19,16 +19,36 @@
 </head>
 <body data-slug="{{ROOM_SLUG}}">
 
-<div id="boot" class="boot">
+<a class="skip-link" href="#board">Skip to the canvas</a>
+
+<!-- role=status so the overlay's message is spoken rather than sat behind
+     silently, which matters most in the case where it never goes away: a boot
+     failure writes its reason in here and moves focus to it. -->
+<div id="boot" class="boot" role="status">
   <div class="boot-inner">
     <div class="boot-grid" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
-    <p id="bootMsg">Loading the canvas…</p>
+    <p id="bootMsg" tabindex="-1">Loading the canvas…</p>
   </div>
 </div>
 
+<!-- Two live regions rather than one, and neither of them is the feed.
+     #srSelf answers something the person just did - where the cursor went,
+     which colour is held, what a placement did - so it may speak the moment it
+     has an answer. #srPeers carries what everybody else is doing, which arrives
+     hundreds of times a minute on a busy canvas and is therefore summarised on
+     a timer instead. Keeping them apart means a digest cannot swallow the
+     answer to a keypress, and the answer to a keypress cannot be delayed
+     because somebody on the other side of the world is painting. -->
+<div id="srSelf" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+<div id="srPeers" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+
 <header class="topbar">
+  <!-- The mark is the only thing in here, and it is decoration, so without the
+       hidden text this link announces as "link" and nothing else. A title
+       attribute is a tooltip, not a name a screen reader can rely on. -->
   <a class="brand" href="/" title="All canvases">
     <span class="brand-mark" aria-hidden="true"></span>
+    <span class="sr-only">All canvases</span>
   </a>
   <div class="room-title">
     <h1 id="roomName">{{ROOM_NAME}}</h1>
@@ -49,35 +69,60 @@
     </div>
     <button class="ghost" id="btnShare">share</button>
     <button class="ghost" id="btnOwner" hidden title="Moderator tools">manage</button>
-    <button class="ghost" id="btnTransport" title="Switch between WebSocket and Server-Sent Events">ws</button>
-    <button class="ghost sq" id="btnHelp" title="Keyboard shortcuts and help" aria-label="Help">?</button>
+    <button class="ghost" id="btnTransport" title="Switch between WebSocket and Server-Sent Events"
+            aria-label="Realtime transport: WebSocket. Activate to switch to Server-Sent Events.">ws</button>
+    <button class="ghost sq" id="btnHelp" title="Keyboard shortcuts and help" aria-label="Help and keyboard shortcuts">?</button>
   </div>
 </header>
 
 <main class="stage" id="stage">
-  <canvas id="board" aria-label="Shared pixel canvas"></canvas>
+  <!-- role=application, which is the only honest description of a grid this
+       size. The alternative is a role=grid of 6,144 cells, which is 6,144 DOM
+       nodes for one canvas and a screen reader walking every one of them. So
+       the canvas takes focus itself, keeps a cell cursor, and reports where
+       that cursor is through the live region above. What role=application buys
+       is the part that makes it work at all: NVDA and JAWS stop intercepting
+       the arrow keys for their own reading cursor and let them reach the page. -->
+  <canvas id="board" tabindex="0" role="application"
+          aria-roledescription="pixel canvas"
+          aria-label="Shared pixel canvas"
+          aria-describedby="canvasHelp"></canvas>
+  <p id="canvasHelp" class="sr-only">Arrow keys move the cursor one cell and
+    Shift with an arrow moves ten. Page Up and Page Down move ten rows, Home and
+    End jump to the ends of the row, Control with Home or End jumps to the
+    corners of the canvas. Enter or Space paints the cursor cell. R describes
+    the eight cells around the cursor, Shift R reads the whole row, M says where
+    the painted areas are. E picks up the colour under the cursor and I asks who
+    painted it. Left and right square bracket step through the palette. Press
+    question mark for the full list.</p>
 
   <!-- The template panel is a reference image quantised to the room's palette
        and drawn under the canvas as a guide. The image is read in the browser
        and never uploaded: a picture you are only using to line up your own
        pixels is nobody else's business, least of all the server's. -->
-  <aside class="panel panel-tpl" id="tplPanel" hidden aria-label="Template overlay">
+  <aside class="panel panel-tpl" id="tplPanel" hidden tabindex="-1"
+         role="group" aria-labelledby="tplPanelTitle">
     <div class="panel-head">
-      <span>template</span>
+      <span id="tplPanelTitle">template</span>
       <button class="ghost sq" id="btnTplClose" aria-label="Close template panel">×</button>
     </div>
 
     <div class="panel-body">
-      <label class="dropzone" id="tplDrop" tabindex="0">
-        <input type="file" id="tplFile" accept="image/*" hidden>
+      <!-- The file input is visually hidden rather than [hidden], so it is
+           still a real, focusable, announced form control with a label. The
+           label around it is what you can see and what a pointer clicks; the
+           input is what a keyboard reaches and what a screen reader names. -->
+      <label class="dropzone" id="tplDrop">
+        <input type="file" id="tplFile" accept="image/*" class="sr-only"
+               aria-describedby="tplDropSub">
         <span class="dropzone-title">drop an image</span>
-        <span class="dropzone-sub">or click to choose · never leaves this browser</span>
+        <span class="dropzone-sub" id="tplDropSub">or click to choose · never leaves this browser</span>
       </label>
 
       <div id="tplLoaded" hidden>
         <div class="row">
-          <span class="row-label">dither</span>
-          <select id="tplMode" class="ghost sel-input"></select>
+          <span class="row-label" id="tplModeLabel">dither</span>
+          <select id="tplMode" class="ghost sel-input" aria-labelledby="tplModeLabel"></select>
         </div>
         <label class="row check">
           <input type="checkbox" id="tplAvoidBg">
@@ -89,12 +134,14 @@
             <span id="tplSize" class="mono">–</span>
             <span id="tplPercent" class="mono">0%</span>
           </div>
-          <div class="bar"><i id="tplBar" style="width:0%"></i></div>
+          <!-- The bar is the same number as the sentence under it, drawn. -->
+          <div class="bar" aria-hidden="true"><i id="tplBar" style="width:0%"></i></div>
           <p class="tpl-count" id="tplCount">0 of 0 cells match</p>
         </div>
 
         <div class="row btns">
-          <button class="ghost sm" id="btnTplMove" title="Then drag on the canvas">position</button>
+          <button class="ghost sm" id="btnTplMove" aria-pressed="false"
+                  title="Then drag on the canvas, or use the arrow keys">position</button>
           <button class="ghost sm" id="btnTplNext" title="Jump to the next cell that does not match, and pick its colour">next cell</button>
         </div>
         <div class="row btns">
@@ -103,14 +150,22 @@
         </div>
       </div>
 
-      <p class="panel-err" id="tplErr" hidden></p>
+      <p class="panel-err" id="tplErr" role="alert" hidden></p>
     </div>
   </aside>
 
+  <!-- Hidden from assistive technology on purpose. It is a second, smaller
+       drawing of the canvas that is already on screen, and its one interaction
+       - click to recentre - is something the arrow keys do better, since they
+       move the cursor and the view together. Exposing it would be another stop
+       on the way to the palette in exchange for nothing. -->
   <canvas id="minimap" class="minimap" width="128" height="128"
-          title="Click to jump there" aria-label="Canvas overview" hidden></canvas>
+          title="Click to jump there" aria-hidden="true" hidden></canvas>
 
   <div class="hud-left">
+    <!-- Deliberately not a live region and deliberately unlabelled: it changes
+         on every pointer move, and the same information reaches a screen reader
+         through #srSelf with the colour and the room's bounds attached. -->
     <div class="coords" id="coords">–, –</div>
     <div class="zoombox">
       <button class="ghost sq" id="btnZoomOut" aria-label="Zoom out">−</button>
@@ -124,8 +179,15 @@
        inspector opens directly under the feed instead of floating at whatever
        height the feed happened to grow to. -->
   <div class="hud-right">
-    <aside class="feed" id="feed" aria-live="polite" aria-label="Live activity">
-      <div class="feed-head">live</div>
+    <!-- This used to be aria-live="polite", which meant every pixel anybody
+         painted anywhere was read out. On a canvas doing three placements a
+         second that is not a feature, it is a reason to close the tab: the
+         announcements never stop and none of them is about you. It is a visual
+         log now, still readable in browse mode as a list, and what a screen
+         reader is actually told about other people goes through #srPeers on a
+         timer instead. -->
+    <aside class="feed" id="feed" aria-label="Recent placements">
+      <div class="feed-head" aria-hidden="true">live</div>
       <ul id="feedList"></ul>
       <p class="feed-empty" id="feedEmpty">waiting for the next pixel</p>
     </aside>
@@ -133,7 +195,8 @@
     <!-- Provenance. A canvas where nobody can ask "who painted this, and what
          was here before" is a grid; being able to ask is what makes it a
          place. -->
-    <aside class="panel panel-inspect" id="inspectPanel" hidden aria-label="Cell history">
+    <aside class="panel panel-inspect" id="inspectPanel" hidden tabindex="-1"
+           role="group" aria-labelledby="inspectTitle">
       <div class="panel-head">
         <span id="inspectTitle">cell</span>
         <button class="ghost sq" id="btnInspectClose" aria-label="Close cell history">×</button>
@@ -142,8 +205,8 @@
     </aside>
   </div>
 
-  <div class="timelapse" id="timelapse" hidden>
-    <button class="ghost sq" id="btnPlay" aria-label="Play or pause">▶</button>
+  <div class="timelapse" id="timelapse" hidden role="group" aria-label="Time-lapse">
+    <button class="ghost sq" id="btnPlay" aria-label="Play the time-lapse">▶</button>
     <input type="range" id="scrub" min="0" max="0" value="0" aria-label="Scrub through canvas history">
     <span class="timelapse-label" id="timelapseLabel">0 / 0</span>
     <a class="ghost sm" id="btnGif" href="#" download>save gif</a>
@@ -152,11 +215,16 @@
 </main>
 
 <footer class="dock">
+  <!-- Not a live region: it ticks ten times a second. The label is here so that
+       reading it in browse mode gives "cooldown, 2.4 seconds" rather than a
+       bare number, and the moment the wait ends is announced through #srSelf -
+       but only when somebody was waiting for it. -->
   <div class="cooldown" id="cooldown">
     <svg viewBox="0 0 40 40" aria-hidden="true">
       <circle class="cd-track" cx="20" cy="20" r="16"></circle>
       <circle class="cd-fill" id="cdFill" cx="20" cy="20" r="16"></circle>
     </svg>
+    <span class="sr-only">Cooldown:</span>
     <span id="cooldownText">ready</span>
   </div>
 
@@ -171,8 +239,9 @@
 </footer>
 
 <div class="sheet" id="sheet" hidden>
-  <div class="sheet-inner">
-    <button class="sheet-close ghost sq" id="btnSheetClose" aria-label="Close">×</button>
+  <div class="sheet-inner" id="sheetInner" role="dialog" aria-modal="true"
+       aria-labelledby="sheetTitle" tabindex="-1">
+    <button class="sheet-close ghost sq" id="btnSheetClose" aria-label="Close this dialog">×</button>
     <div id="sheetBody"></div>
   </div>
 </div>

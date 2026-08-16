@@ -372,7 +372,16 @@ func (c *Conn) authenticate() error {
 // should continue reading further messages.
 func (c *Conn) handleAuth(body []byte) (bool, error) {
 	r := &readBuf{b: body}
-	switch code := r.int32(); code {
+	code := r.int32()
+	// A short read yields zero, and zero is AuthenticationOk. Without this check
+	// an 'R' message the server never finished sending - a truncated frame, a
+	// proxy that cut the stream, anything at all in that shape - is indis-
+	// tinguishable from "you are authenticated", and the driver goes on to hand
+	// the caller a session it never proved it was entitled to.
+	if r.err != nil {
+		return false, fmt.Errorf("pg: truncated authentication message: %w", r.err)
+	}
+	switch code {
 	case authOK:
 		return true, nil
 
@@ -631,6 +640,11 @@ func (c *Conn) QueryRow(ctx context.Context, sql string, args ...any) ([][]byte,
 // left in a reusable state.
 func (c *Conn) readUntilReady(res *Result) (byte, error) {
 	var firstErr error
+	// described is the column count of the RowDescription in force, or -1 when
+	// none has arrived. Callers index rows by the position of the column they
+	// asked for, so a row that does not match the description they were also
+	// given is a panic waiting to happen in their code rather than ours.
+	described := -1
 	for {
 		m, err := readMessage(c.r)
 		if err != nil {
@@ -658,6 +672,7 @@ func (c *Conn) readUntilReady(res *Result) (byte, error) {
 			if r.err != nil && firstErr == nil {
 				firstErr = r.err
 			}
+			described = len(res.Columns)
 
 		case msgDataRow:
 			if res == nil {
@@ -665,6 +680,13 @@ func (c *Conn) readUntilReady(res *Result) (byte, error) {
 			}
 			r := &readBuf{b: m.body}
 			n := int(r.int16())
+			if described >= 0 && n != described {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("pg: DataRow carries %d fields but the "+
+						"RowDescription named %d columns", n, described)
+				}
+				continue
+			}
 			row := make([][]byte, 0, max(n, 0))
 			for i := 0; i < n; i++ {
 				size := int(r.int32())
@@ -672,8 +694,13 @@ func (c *Conn) readUntilReady(res *Result) (byte, error) {
 					row = append(row, nil)
 					continue
 				}
-				v := r.next(size)
-				row = append(row, append([]byte(nil), v...))
+				// A zero-length field is an empty string, and an empty string is
+				// not SQL NULL. Appending to a nil slice adds nothing and stays
+				// nil, so copying into a slice that is already non-nil is what
+				// keeps the two distinguishable to the caller.
+				val := make([]byte, size)
+				copy(val, r.next(size))
+				row = append(row, val)
 			}
 			if r.err != nil {
 				if firstErr == nil {
@@ -743,6 +770,13 @@ func affectedFromTag(tag string) int64 {
 }
 
 func (c *Conn) applyDeadline(ctx context.Context) error {
+	// Close nils out raw, and calling a method on a nil net.Conn interface is a
+	// nil dereference, not an error. Every query path starts here, so one check
+	// turns "the pool discarded this connection while a caller still held it"
+	// from a process-killing panic into an error the caller can report.
+	if c.raw == nil {
+		return errors.New("pg: connection is closed")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}

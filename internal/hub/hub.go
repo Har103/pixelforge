@@ -43,9 +43,9 @@ type Subscriber struct {
 	// That leaves a window in which another goroutine can close this channel
 	// between the copy and the send - and a send on a closed channel is not a
 	// dropped message, it is a panic that takes the whole process with it.
-	// Every broadcast reaches this from somewhere: a request goroutine
-	// announcing presence, the coalescing loop flushing pixels, the cursor tick,
-	// and shutdown closing everything at once.
+	// Every broadcast reaches this from somewhere: the coalescing loop flushing
+	// pixels and announcing presence, a request goroutine sending a control
+	// message, the cursor tick, and shutdown closing everything at once.
 	mu     sync.Mutex
 	closed bool
 }
@@ -92,8 +92,23 @@ type Hub struct {
 
 	tick time.Duration
 
-	lastPresence int
-	presenceAt   time.Time
+	// Presence is announced by Run rather than by whoever joined or left, and
+	// what is recorded here is only that the set changed - never what it changed
+	// to. A client wants the number that is true now, not a replay of every
+	// number it passed through on the way, so a burst of arrivals collapses into
+	// a single frame carrying the figure at the end of it. See presenceStep.
+	//
+	// This state deliberately does not live under mu, even though mu is already
+	// the lock that guards who is connected. Announcing means broadcasting, and
+	// broadcast takes mu to copy the subscriber set: mu is an RWMutex and Go's
+	// RWMutex is not reentrant, so an announcement made while holding mu would
+	// deadlock the room outright the first time anybody joined. A separate lock
+	// makes that mistake impossible to make by accident rather than merely
+	// avoided by the order the statements happen to be in today.
+	presenceMu    sync.Mutex
+	presenceDirty bool
+	presenceAt    time.Time
+	presenceEvery time.Duration
 
 	// bufferSize is how many frames a slow client may fall behind before it is
 	// disconnected. Small on purpose: a client that cannot keep up with the
@@ -106,16 +121,19 @@ type Hub struct {
 	}
 }
 
-// New creates a hub. Call Run to start the broadcast loop.
+// New creates a hub. Call Run to start the broadcast loop: it is what turns
+// queued placements and subscriber-set changes into frames, so a hub that is
+// never run delivers neither pixels nor presence.
 func New(log *slog.Logger) *Hub {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Hub{
-		subs:       make(map[uint64]*Subscriber),
-		log:        log,
-		tick:       50 * time.Millisecond,
-		bufferSize: 32,
+		subs:          make(map[uint64]*Subscriber),
+		log:           log,
+		tick:          50 * time.Millisecond,
+		presenceEvery: time.Second,
+		bufferSize:    32,
 	}
 }
 
@@ -132,7 +150,7 @@ func (h *Hub) Subscribe(name string) *Subscriber {
 	h.mu.Unlock()
 
 	h.log.Debug("client subscribed", "id", s.ID, "transport", name, "total", n)
-	h.announcePresence(true)
+	h.markPresence()
 	return s
 }
 
@@ -147,7 +165,7 @@ func (h *Hub) Unsubscribe(s *Subscriber) {
 	h.mu.Unlock()
 
 	h.log.Debug("client unsubscribed", "id", s.ID, "transport", s.Name, "total", n)
-	h.announcePresence(true)
+	h.markPresence()
 }
 
 // Count reports how many clients are connected.
@@ -164,22 +182,25 @@ func (h *Hub) Publish(p canvas.Pixel) {
 	h.pendMu.Unlock()
 }
 
-// Run drives the coalescing loop until done is closed.
+// Run drives the coalescing loop until done is closed. Presence rides the same
+// tick as placements, so both are the work of one goroutine on a known schedule
+// rather than of whichever request happened to arrive.
 func (h *Hub) Run(done <-chan struct{}) {
 	t := time.NewTicker(h.tick)
 	defer t.Stop()
-	presence := time.NewTicker(5 * time.Second)
-	defer presence.Stop()
 
 	for {
 		select {
 		case <-done:
 			h.closeAll()
 			return
-		case <-t.C:
+		case now := <-t.C:
 			h.flush()
-		case <-presence.C:
-			h.announcePresence(false)
+			// The tick already carries the time it fired, and taking a second
+			// reading here would differ from it only by however long the flush
+			// took - which is not a quantity the presence throttle should be
+			// measuring.
+			h.presenceStep(now)
 		}
 	}
 }
@@ -259,27 +280,48 @@ func (h *Hub) BroadcastJSON(v any) {
 	h.broadcast(f, f)
 }
 
-// announcePresence tells clients how many people are connected. force sends even
-// if the count has not changed, but never more than once a second.
-func (h *Hub) announcePresence(force bool) {
-	n := h.Count()
+// markPresence records that somebody joined or left, for Run to act on.
+//
+// Announcing from here instead - which is what Subscribe and Unsubscribe used to
+// do - makes one arrival cost a frame to every client already in the room, so N
+// people filling a room cost N^2/2 frames between them. At a few hundred that is
+// no longer a cost, it is an outage: the frames arrive faster than a client can
+// be scheduled to read them, its 32-frame buffer fills, and broadcast drops it as
+// too slow. People were being disconnected from the canvas by other people
+// arriving, and every one of those disconnections was itself another presence
+// change, which broadcast another N frames.
+func (h *Hub) markPresence() {
+	h.presenceMu.Lock()
+	h.presenceDirty = true
+	h.presenceMu.Unlock()
+}
 
-	h.mu.Lock()
-	changed := n != h.lastPresence
-	tooSoon := time.Since(h.presenceAt) < time.Second
-	if !changed && !force {
-		h.mu.Unlock()
-		return
+// presenceStep announces the headcount if the subscriber set has changed since
+// the last announcement and that announcement is not too recent, reporting
+// whether it sent anything.
+//
+// The throttle is leading-edge with a trailing announcement: a change to a room
+// that has been quiet goes out on the very next tick, a burst costs one frame per
+// presenceEvery however many people it involves, and the dirty flag survives the
+// wait so the figure the room settles on is always delivered. A count that is a
+// second stale is invisible to somebody watching a number tick over; a count that
+// is permanently wrong is a bug report.
+//
+// The set is counted here rather than at the moment it changed, because after a
+// burst of joins and leaves the only number worth sending is the one that is true
+// now.
+func (h *Hub) presenceStep(now time.Time) bool {
+	h.presenceMu.Lock()
+	if !h.presenceDirty || now.Sub(h.presenceAt) < h.presenceEvery {
+		h.presenceMu.Unlock()
+		return false
 	}
-	if tooSoon && !changed {
-		h.mu.Unlock()
-		return
-	}
-	h.lastPresence = n
-	h.presenceAt = time.Now()
-	h.mu.Unlock()
+	h.presenceDirty = false
+	h.presenceAt = now
+	h.presenceMu.Unlock()
 
-	h.BroadcastJSON(map[string]any{"t": "presence", "n": n})
+	h.BroadcastJSON(map[string]any{"t": "presence", "n": h.Count()})
+	return true
 }
 
 func (h *Hub) closeAll() {

@@ -55,6 +55,18 @@ const S = {
   tplMove: false,       // dragging the template into position
   inspect: null,        // the cell whose provenance is on screen
   minimap: true,
+  booted: false,
+  // The keyboard's own place on the grid. It is not the pointer: the pointer is
+  // wherever the mouse happens to be and forgets itself the moment it leaves,
+  // while this is a position somebody is standing on and will still be standing
+  // on after they have gone to the palette and come back.
+  kb: { cell: null, shown: false, oriented: false },
+  // Anything this tab placed, kept just long enough to recognise it coming back
+  // on the broadcast. See notePlacement.
+  mine: [],
+  peers: { seen: 0, near: 0, lastNear: 0, clients: 0, saidClients: -1 },
+  awaitReady: false,    // somebody is waiting out a cooldown and asked to be told
+  sheetReturn: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -77,7 +89,8 @@ const el = {
   tplCount: $('tplCount'), tplErr: $('tplErr'),
   btnTplMove: $('btnTplMove'), btnTplToggle: $('btnTplToggle'),
   inspectPanel: $('inspectPanel'), inspectTitle: $('inspectTitle'), inspectBody: $('inspectBody'),
-  btnUndo: $('btnUndo'),
+  btnUndo: $('btnUndo'), btnTemplate: $('btnTemplate'),
+  srSelf: $('srSelf'), srPeers: $('srPeers'), sheetInner: $('sheetInner'),
 };
 
 const ctx = el.board.getContext('2d', { alpha: false });
@@ -118,6 +131,206 @@ function hueFor(uid) {
   return CURSOR_HUES[h % CURSOR_HUES.length];
 }
 const cursorColour = (uid) => `hsl(${hueFor(uid)} 85% 62%)`;
+
+// ------------------------------------------------------------ announcing --
+
+// What a screen reader is told, and — the harder half — what it is not.
+//
+// This canvas produces hundreds of events a minute and almost none of them are
+// worth a sentence. Two rules keep the volume survivable. Anything the person
+// is in the middle of doing is announced on a trailing debounce, so holding an
+// arrow key across forty cells says where they arrived rather than naming all
+// forty. Anything anybody else did is summarised on a slow tick instead, and
+// the tick stays silent when there is nothing to summarise.
+
+const SAY_SETTLE_MS = 130;
+
+let selfTimer = null;
+let sayFlip = false;
+
+// Assistive technology ignores a live region set to the text it already holds,
+// and "cooling down" twice running is a thing somebody genuinely needs to hear
+// twice. A zero-width space, alternated, makes every write textually new
+// without adding a syllable to what is spoken.
+function writeRegion(region, text) {
+  sayFlip = !sayFlip;
+  region.textContent = text + (sayFlip ? '\u200B' : '');
+}
+
+// saySelf answers something the person just did. A later message always
+// replaces a pending earlier one, because the later one is by definition about
+// where they now are.
+function saySelf(text, settle) {
+  clearTimeout(selfTimer);
+  selfTimer = null;
+  if (!settle) { writeRegion(el.srSelf, text); return; }
+  selfTimer = setTimeout(() => { selfTimer = null; writeRegion(el.srSelf, text); }, settle);
+}
+
+function sayPeers(text) { writeRegion(el.srPeers, text); }
+
+// Colour names are derived from the hex rather than looked up in a table,
+// because the palette belongs to the room and a room can be created with any of
+// them — a table here would go stale the first time somebody adds a palette to
+// the server, and a hex code read out as eight characters is not a colour.
+function hsl(hex) {
+  const rgb = hexToRGB(hex).map((v) => v / 255);
+  const [r, g, b] = rgb;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  const d = max - min;
+  if (d === 0) return { h: 0, s: 0, l };
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  let h;
+  if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+  else if (max === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  return { h: h * 60, s, l };
+}
+
+const HUE_NAMES = [
+  [16, 'red'], [45, 'orange'], [66, 'yellow'], [95, 'lime'], [150, 'green'],
+  [178, 'teal'], [200, 'cyan'], [242, 'blue'], [265, 'indigo'], [290, 'violet'],
+  [320, 'purple'], [340, 'pink'], [361, 'red'],
+];
+
+function colourName(index) {
+  if (index === 0) return 'background';
+  const hex = S.palette[index];
+  if (!hex) return 'colour ' + index;
+  const c = hsl(hex);
+  if (c.s < 0.15) {
+    if (c.l < 0.12) return 'black';
+    if (c.l < 0.35) return 'dark grey';
+    if (c.l < 0.66) return 'grey';
+    if (c.l < 0.9) return 'light grey';
+    return 'white';
+  }
+  let name = 'colour ' + index;
+  for (let i = 0; i < HUE_NAMES.length; i++) {
+    if (c.h < HUE_NAMES[i][0]) { name = HUE_NAMES[i][1]; break; }
+  }
+  // Dark orange is brown. Every palette here has one and nobody calls it
+  // orange, so the arithmetic has to know that too.
+  if ((name === 'orange' || name === 'yellow') && c.l < 0.45) return 'brown';
+  if (c.l < 0.34) return 'dark ' + name;
+  if (c.l > 0.75) return 'pale ' + name;
+  // Barely saturated is a grey with an opinion, and calling #6b7899 "blue"
+  // sends somebody looking for something bluer than anything on the canvas.
+  if (c.s < 0.3) return name + ' grey';
+  return name;
+}
+
+// ------------------------------------------------------------- describing --
+
+// Joining a list the way a person would say it, because "north, east" and
+// "north and east" are the difference between a readout and a sentence.
+function spoken(words) {
+  if (words.length <= 1) return words[0] || '';
+  return words.slice(0, -1).join(', ') + ' and ' + words[words.length - 1];
+}
+
+const colourAt = (x, y) => S.pixels[y * S.W + x];
+
+function cellText(x, y) {
+  return x + ', ' + y + ', ' + colourName(colourAt(x, y)) + (lockedAt(x, y) ? ', locked' : '');
+}
+
+const AROUND = [
+  [0, -1, 'north'], [1, -1, 'north-east'], [1, 0, 'east'], [1, 1, 'south-east'],
+  [0, 1, 'south'], [-1, 1, 'south-west'], [-1, 0, 'west'], [-1, -1, 'north-west'],
+];
+
+// One cell at a time is how you read a canvas through a keyhole. This is the
+// smallest readout that is actually a picture: eight neighbours, grouped by
+// colour so that "red to the east and south-east" arrives as a shape rather
+// than as eight separate facts.
+function describeAround(x, y) {
+  const groups = new Map();
+  const edges = [];
+  AROUND.forEach((d) => {
+    const nx = x + d[0], ny = y + d[1];
+    if (nx < 0 || ny < 0 || nx >= S.W || ny >= S.H) { edges.push(d[2]); return; }
+    const name = colourName(colourAt(nx, ny));
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push(d[2]);
+  });
+
+  const head = 'Around ' + x + ', ' + y + ', which is ' + colourName(colourAt(x, y)) + ': ';
+  if (groups.size === 1 && !edges.length) {
+    return head + 'all eight neighbours are ' + [...groups.keys()][0] + '.';
+  }
+
+  // Biggest group last and folded into "the rest", because on a canvas that is
+  // mostly empty the small groups are the entire content of the answer.
+  const ordered = [...groups.entries()].sort((a, b) => b[1].length - a[1].length);
+  const rest = ordered.length > 1 && ordered[0][1].length >= 4 ? ordered.shift() : null;
+  const parts = ordered.map((g) => g[0] + ' to the ' + spoken(g[1]));
+  if (edges.length) parts.push('the canvas edge to the ' + spoken(edges));
+  if (rest) parts.push('the rest ' + rest[0]);
+  return head + parts.join('; ') + '.';
+}
+
+// A whole row, run-length encoded, and only the painted runs: on a canvas that
+// is four percent full, listing the gaps is listing the canvas.
+function describeRow(y) {
+  const runs = [];
+  let start = 0;
+  for (let x = 1; x <= S.W; x++) {
+    const prev = colourAt(x - 1, y);
+    if (x === S.W || colourAt(x, y) !== prev) {
+      if (prev !== 0) runs.push({ from: start, to: x - 1, c: prev });
+      start = x;
+    }
+  }
+  if (!runs.length) return 'Row ' + y + ' of ' + S.H + ' is empty.';
+
+  let painted = 0;
+  runs.forEach((r) => { painted += r.to - r.from + 1; });
+  const shown = runs.slice(0, 10).map((r) => (r.from === r.to
+    ? 'column ' + r.from
+    : 'columns ' + r.from + ' to ' + r.to) + ' ' + colourName(r.c));
+  const more = runs.length - shown.length;
+  return 'Row ' + y + ': ' + painted + ' of ' + S.W + ' cells painted. ' +
+    spoken(shown) + (more ? ', and ' + more + ' more run' + (more === 1 ? '' : 's') : '') + '.';
+}
+
+const SECTORS = ['top left', 'top', 'top right', 'left', 'middle', 'right',
+  'bottom left', 'bottom', 'bottom right'];
+
+// Where the art is. Without this a keyboard user has no way to find out that
+// everything happening on a 96×64 grid is happening in one corner of it, short
+// of walking the whole canvas a row at a time.
+function describeRegions() {
+  const counts = new Array(9).fill(0);
+  let painted = 0;
+  for (let y = 0; y < S.H; y++) {
+    const band = Math.min(2, Math.floor((y * 3) / S.H));
+    for (let x = 0; x < S.W; x++) {
+      if (colourAt(x, y) === 0) continue;
+      painted++;
+      counts[band * 3 + Math.min(2, Math.floor((x * 3) / S.W))]++;
+    }
+  }
+  const size = S.W + ' by ' + S.H;
+  if (!painted) return 'Canvas ' + size + ', nothing painted yet.';
+
+  const pct = (painted / (S.W * S.H)) * 100;
+  const busiest = counts
+    .map((n, i) => ({ n, name: SECTORS[i] }))
+    .filter((s) => s.n > 0)
+    .sort((a, b) => b.n - a.n)
+    .slice(0, 3)
+    .map((s) => s.name + ', ' + s.n);
+  let where = '';
+  if (S.kb.cell) {
+    const band = Math.min(2, Math.floor((S.kb.cell.y * 3) / S.H));
+    const col = Math.min(2, Math.floor((S.kb.cell.x * 3) / S.W));
+    where = ' Your cursor is in the ' + SECTORS[band * 3 + col] + '.';
+  }
+  return 'Canvas ' + size + ', ' + (pct < 1 ? 'under 1' : Math.round(pct)) +
+    ' percent painted. Busiest: ' + spoken(busiest) + '.' + where;
+}
 
 // -------------------------------------------------------------- rendering --
 
@@ -308,6 +521,21 @@ function render() {
     ctx.restore();
   }
 
+  // The keyboard cursor: a white box inside a black one, because a caret drawn
+  // in one colour vanishes the moment somebody paints the cell it is standing
+  // on, and on a twenty colour palette that is a matter of when rather than if.
+  if (S.kb.shown && S.kb.cell && !S.lapse) {
+    const kx = ox + S.kb.cell.x * scale, ky = oy + S.kb.cell.y * scale;
+    ctx.save();
+    ctx.strokeStyle = '#000000';
+    ctx.lineWidth = 4;
+    ctx.strokeRect(kx - 2, ky - 2, scale + 4, scale + 4);
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(kx - 2, ky - 2, scale + 4, scale + 4);
+    ctx.restore();
+  }
+
   // The cell whose provenance is open, marked so the panel and the grid agree.
   if (S.inspect) {
     const ix = ox + S.inspect.x * scale, iy = oy + S.inspect.y * scale;
@@ -384,6 +612,97 @@ function updateZoomLabel() {
   el.zoomLabel.textContent = (s >= 10 ? Math.round(s) : s.toFixed(1)) + '×';
 }
 
+// -------------------------------------------------------------- the caret --
+
+// Arrow keys used to pan the view by forty pixels. They move this cursor now,
+// and the view follows it. The trade is one-sided: panning already had the
+// drag, the minimap, fit-to-screen and the zoom box, while painting had no
+// keyboard route at all — the product's entire claim was unavailable to
+// anybody who does not use a mouse. Moving the cursor pans as a side effect, so
+// nothing was actually lost; panning without moving the cursor was never worth
+// a keystroke of its own.
+
+function cellInView() {
+  const r = el.stage.getBoundingClientRect();
+  return {
+    x: clamp(Math.floor((r.width / 2 - S.view.ox) / S.view.scale), 0, S.W - 1),
+    y: clamp(Math.floor((r.height / 2 - S.view.oy) / S.view.scale), 0, S.H - 1),
+  };
+}
+
+// A sighted keyboard user has to be able to see where the cursor went, so the
+// view chases it — minimally when it is stepping, and by recentring when it has
+// jumped somewhere it could not have walked to.
+function keepCursorInView(centre) {
+  const c = S.kb.cell;
+  if (!c) return;
+  const r = el.stage.getBoundingClientRect();
+  const s = S.view.scale;
+  if (centre) {
+    S.view.ox = r.width / 2 - (c.x + 0.5) * s;
+    S.view.oy = r.height / 2 - (c.y + 0.5) * s;
+    S.dirty = true;
+    return;
+  }
+  // Two cells of clearance, or forty pixels. At one pixel per cell "just on
+  // screen" and "off screen" look identical. The margin is capped at half the
+  // stage so that a viewport smaller than the margin cannot ask for a window
+  // with nothing in it and leave the view oscillating.
+  const padX = Math.min(Math.max(40, s * 2), Math.max(0, (r.width - s) / 2));
+  const padY = Math.min(Math.max(40, s * 2), Math.max(0, (r.height - s) / 2));
+  const left = S.view.ox + c.x * s, right = left + s;
+  const top = S.view.oy + c.y * s, bottom = top + s;
+  if (left < padX) S.view.ox += padX - left;
+  else if (right > r.width - padX) S.view.ox -= right - (r.width - padX);
+  if (top < padY) S.view.oy += padY - top;
+  else if (bottom > r.height - padY) S.view.oy -= bottom - (r.height - padY);
+  S.dirty = true;
+}
+
+function announceCursor(settle) {
+  if (!S.kb.cell) return;
+  saySelf(cellText(S.kb.cell.x, S.kb.cell.y), settle);
+}
+
+function setCursor(x, y, opts) {
+  const o = opts || {};
+  S.kb.cell = { x: clamp(x, 0, S.W - 1), y: clamp(y, 0, S.H - 1) };
+  S.kb.shown = true;
+  el.coords.textContent = S.kb.cell.x + ', ' + S.kb.cell.y;
+  keepCursorInView(o.centre);
+  // Somebody moving by keyboard is present in the room exactly as much as
+  // somebody moving a mouse, and everyone else should see them arrive.
+  sendCursor(S.kb.cell);
+  S.dirty = true;
+  if (o.quiet) return;
+  announceCursor(o.settle === undefined ? SAY_SETTLE_MS : o.settle);
+}
+
+function moveCursor(dx, dy) {
+  if (!S.pixels) return;
+  if (!S.kb.cell) {
+    // The first press puts the cursor where the person is already looking
+    // rather than at a corner they would then have to walk back from.
+    const start = cellInView();
+    setCursor(start.x, start.y);
+    return;
+  }
+  const nx = clamp(S.kb.cell.x + dx, 0, S.W - 1);
+  const ny = clamp(S.kb.cell.y + dy, 0, S.H - 1);
+  if (nx === S.kb.cell.x && ny === S.kb.cell.y) {
+    // Silence here would be indistinguishable from a key that did not register.
+    const edge = dx < 0 ? 'left' : dx > 0 ? 'right' : dy < 0 ? 'top' : 'bottom';
+    saySelf('The ' + edge + ' edge. ' + cellText(nx, ny));
+    return;
+  }
+  setCursor(nx, ny);
+}
+
+function jumpCursor(x, y) {
+  if (!S.pixels) return;
+  setCursor(x, y, { centre: true, settle: 0 });
+}
+
 function screenToCell(clientX, clientY) {
   const r = el.stage.getBoundingClientRect();
   const x = Math.floor((clientX - r.left - S.view.ox) / S.view.scale);
@@ -394,6 +713,13 @@ function screenToCell(clientX, clientY) {
 
 // ----------------------------------------------------------------- palette --
 
+// The swatch's spoken name. A hex code read out as eight characters is not a
+// colour, and the digit that selects it is worth more than either.
+function swatchLabel(i, hex) {
+  const key = i <= 10 ? ', key ' + (i % 10) : '';
+  return colourName(i) + ', ' + hex + key;
+}
+
 function buildPalette() {
   el.palette.innerHTML = '';
   S.palette.forEach((hex, i) => {
@@ -403,6 +729,11 @@ function buildPalette() {
     b.type = 'button';
     b.setAttribute('role', 'radio');
     b.setAttribute('aria-checked', String(i === S.color));
+    b.setAttribute('aria-label', swatchLabel(i, hex));
+    // A roving tabindex, because twenty swatches were twenty tab stops between
+    // the canvas and the undo button. A radio group is one stop and the arrows
+    // move within it; anything else makes a keyboard user walk the rainbow.
+    b.tabIndex = i === S.color ? 0 : -1;
     b.title = i === 0 ? 'background (' + hex + ')' : hex + (i <= 10 ? '  ·  key ' + (i % 10) : '');
     b.addEventListener('click', () => selectColor(i));
     el.palette.appendChild(b);
@@ -434,13 +765,23 @@ function buildTemplateModes() {
     : (modes[0] && modes[0].key) || 'none';
 }
 
-function selectColor(i) {
+function selectColor(i, quiet) {
   if (i < 0 || i >= S.palette.length) return;
   S.color = i;
   [...el.palette.children].forEach((c, idx) => {
-    c.classList.toggle('sel', idx === i);
-    c.setAttribute('aria-checked', String(idx === i));
+    const on = idx === i;
+    c.classList.toggle('sel', on);
+    c.setAttribute('aria-checked', String(on));
+    c.tabIndex = on ? 0 : -1;
   });
+  // Which colour is in your hand is the one piece of state you cannot see by
+  // looking at the cell under the cursor, so it is said out loud when it
+  // changes rather than only when something is painted with it.
+  if (!quiet) saySelf(colourName(i) + ' selected.');
+  // Everybody else's view of what this painter is holding travels with the
+  // cursor, so a colour picked from the keyboard has to refresh it.
+  const at = S.kb.cell || S.hover;
+  if (at) sendCursor(at);
 }
 
 // --------------------------------------------------------------- cooldown --
@@ -454,6 +795,9 @@ function cooldownTick() {
     // A room with no cooldown is never "ready" in the sense of having waited,
     // and saying so every frame overwrote the label boot had set correctly.
     el.cooldownText.textContent = S.cooldownMs === 0 ? 'no limit' : 'ready';
+    // Said once, and only to somebody who was actually waiting. Announcing
+    // every cooldown would be an interruption every 750ms on the default room.
+    if (S.awaitReady) { S.awaitReady = false; saySelf('Ready to paint.'); }
   } else {
     const frac = clamp(left / S.cooldownMs, 0, 1);
     el.cdFill.style.strokeDashoffset = String(circumference * frac);
@@ -466,9 +810,16 @@ function cooldownTick() {
 const canPlace = () => Date.now() >= S.readyAt;
 
 function setPaused(paused) {
+  const changed = S.booted && S.paused !== paused;
   S.paused = paused;
   el.pausedBadge.hidden = !paused;
   document.body.classList.toggle('is-paused', paused);
+  // A canvas that stops accepting pixels while you are painting on it is the
+  // one moderator action a painter has to be told about; the badge that says so
+  // is a badge.
+  if (changed) {
+    sayPeers(paused ? 'The owner paused this canvas. Painting is off.' : 'Painting has resumed.');
+  }
 }
 
 // ------------------------------------------------------------------- feed --
@@ -487,6 +838,74 @@ function pushFeed(x, y, colorIndex) {
   while (el.feedList.children.length > 40) el.feedList.lastChild.remove();
 }
 
+// ------------------------------------------------------------- other people --
+
+// Presence, summarised, because there is no version of announcing every remote
+// placement that is not hostile — a busy canvas produces several a second and
+// none of them is about you.
+//
+// One thing gets through immediately: a pixel landing next to yours. That is
+// the event you cannot see coming and the one that makes a shared canvas feel
+// shared, so it interrupts once and then stays quiet for ten seconds however
+// much lands after it. Everything else is a count on a slow tick, and the tick
+// says nothing at all when there is nothing to count.
+const NEAR_CELLS = 4;
+const NEAR_QUIET_MS = 10000;
+const DIGEST_MS = 12000;
+
+// A placement this tab made, remembered only long enough to recognise it coming
+// back. The broadcast carries no painter id, so the alternative is a digest
+// that counts your own work as somebody else's.
+function rememberMine(x, y, c) {
+  const now = Date.now();
+  S.mine = S.mine.filter((m) => now - m.t < 5000);
+  S.mine.push({ x, y, c, t: now });
+}
+
+function notePlacement(x, y, c) {
+  for (let i = 0; i < S.mine.length; i++) {
+    const m = S.mine[i];
+    if (m.x === x && m.y === y && m.c === c) { S.mine.splice(i, 1); return; }
+  }
+  S.peers.seen++;
+  if (!S.kb.cell) return;
+  const away = Math.max(Math.abs(x - S.kb.cell.x), Math.abs(y - S.kb.cell.y));
+  if (away > NEAR_CELLS) return;
+  S.peers.near++;
+  const now = Date.now();
+  if (now - S.peers.lastNear < NEAR_QUIET_MS) return;
+  S.peers.lastNear = now;
+  sayPeers('Somebody painted ' + colourName(c) + ' at ' + x + ', ' + y + ', ' +
+    (away === 1 ? 'right next to your cursor' : away + ' cells from your cursor') + '.');
+}
+
+function digestPeers() {
+  // A backgrounded tab is not a tab anybody is listening to, and a queue of
+  // digests read out on return is worse than having missed them.
+  if (document.hidden) { S.peers.seen = 0; S.peers.near = 0; return; }
+  const parts = [];
+  if (S.peers.seen > 0) {
+    parts.push(S.peers.seen + (S.peers.seen === 1 ? ' pixel' : ' pixels') +
+      ' painted in the last ' + Math.round(DIGEST_MS / 1000) + ' seconds');
+    if (S.peers.near > 0) parts.push(S.peers.near + ' of them beside you');
+  }
+  if (S.peers.clients !== S.peers.saidClients) {
+    S.peers.saidClients = S.peers.clients;
+    parts.push(S.peers.clients + (S.peers.clients === 1 ? ' person here' : ' people here'));
+  }
+  S.peers.seen = 0;
+  S.peers.near = 0;
+  if (parts.length) sayPeers(parts.join(', ') + '.');
+}
+
+function notePresence(n) {
+  if (typeof n !== 'number') return;
+  el.statClients.textContent = fmt(n);
+  // The first count is this tab arriving, which nobody needs telling about.
+  if (S.peers.saidClients < 0) S.peers.saidClients = n;
+  S.peers.clients = n;
+}
+
 // -------------------------------------------------------------- placement --
 
 function lockedAt(x, y) {
@@ -496,11 +915,17 @@ function lockedAt(x, y) {
 }
 
 function tryPlace(x, y) {
+  // Every refusal below reaches a screen reader through the toast, which is
+  // already a status region; saying it a second time here would double every
+  // one of them.
   if (S.lapse) { toast('exit time-lapse to paint'); return; }
   if (S.paused) { toast('the owner has paused this canvas', 'warn'); return; }
   if (lockedAt(x, y)) { toast('that area is locked', 'warn'); return; }
   if (!canPlace()) {
     toast('cooling down — ' + ((S.readyAt - Date.now()) / 1000).toFixed(1) + 's', 'warn');
+    // Somebody who has just been refused is by definition waiting, so this is
+    // the one case where the end of the wait is worth announcing.
+    S.awaitReady = true;
     return;
   }
   if (S.pixels[y * S.W + x] === S.color) { toast('already that colour'); return; }
@@ -510,6 +935,13 @@ function tryPlace(x, y) {
   const previous = S.pixels[y * S.W + x];
   writePixel(x, y, S.color);
   S.readyAt = Date.now() + S.cooldownMs;
+  rememberMine(x, y, S.color);
+  // Success is silent on screen — the pixel simply appears — so it is the one
+  // outcome that has nothing to announce it unless this does.
+  saySelf('Painted ' + colourName(S.color) + ' at ' + x + ', ' + y + '.');
+  // A cooldown short enough to be over before the sentence finishes is not
+  // worth a second sentence about.
+  if (S.cooldownMs >= 2000) S.awaitReady = true;
 
   const payload = { t: 'place', x, y, c: S.color };
   if (S.transport === 'ws' && S.socket && S.socket.readyState === WebSocket.OPEN) {
@@ -567,20 +999,56 @@ function sendCursor(cell) {
 
 // ---------------------------------------------------------------- template --
 
+// ---------------------------------------------------------------- focus ---
+
+// Focus is a place. Anything that takes it has to be able to put it back, and
+// anything that removes the element holding it has to notice that it did — a
+// panel that closes while its own close button is focused drops the keyboard
+// user at the top of the document with no idea why.
+
+const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), ' +
+  'select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function focusables(root) {
+  return [...root.querySelectorAll(FOCUSABLE)]
+    .filter((n) => !n.hidden && n.getClientRects().length > 0);
+}
+
+// getClientRects rather than offsetParent: everything on this page is inside a
+// position:fixed bar, and offsetParent is null for all of them.
+function focusable(node) {
+  return !!node && document.contains(node) && !node.hidden && node.getClientRects().length > 0;
+}
+
+// The canvas is the fallback because it is the page: dropping somebody back
+// there is always more useful than dropping them on <body>.
+function focusBack(node) {
+  (focusable(node) ? node : el.board).focus();
+}
+
 function templateError(message) {
   el.tplErr.hidden = !message;
   el.tplErr.textContent = message || '';
 }
 
 function openTemplate() {
+  if (!el.tplPanel.hidden) return;
+  S.tplReturn = document.activeElement;
   el.tplPanel.hidden = false;
   templateError('');
+  // The panel is a group of controls somebody deliberately opened in order to
+  // use, so focus goes into it rather than leaving them to hunt for it.
+  el.tplPanel.focus();
 }
 
 function closeTemplate() {
+  if (el.tplPanel.hidden) return;
+  const inside = el.tplPanel.contains(document.activeElement);
   el.tplPanel.hidden = true;
   S.tplMove = false;
   el.btnTplMove.classList.remove('on');
+  if (inside) focusBack(S.tplReturn);
+  S.tplReturn = null;
 }
 
 function clearTemplate() {
@@ -670,21 +1138,28 @@ function jumpToNextCell() {
   const p = S.template.progress(S.pixels, S.W);
   if (!p.nextMismatch) { toast('the template is complete', 'good'); return; }
   const { x, y, want } = p.nextMismatch;
-  selectColor(want);
-  const r = el.stage.getBoundingClientRect();
-  S.view.ox = r.width / 2 - (x + 0.5) * S.view.scale;
-  S.view.oy = r.height / 2 - (y + 0.5) * S.view.scale;
+  selectColor(want, true);
   S.hover = { x, y };
-  el.coords.textContent = x + ', ' + y;
-  S.dirty = true;
+  // The cursor goes too, so that "next cell" and Enter are the whole tracing
+  // loop for somebody who never touches the mouse. Whether it is *drawn* is
+  // left as it was: a pointer user pressing this button has not asked for a
+  // caret and would only get a second highlight on the cell they are looking at.
+  const wasShown = S.kb.shown;
+  setCursor(x, y, { centre: true, quiet: true });
+  S.kb.shown = wasShown;
+  saySelf('Next cell to paint: ' + x + ', ' + y + '. ' + colourName(want) + ' selected.');
 }
 
 // --------------------------------------------------------------- inspector --
 
 function closeInspect() {
+  if (el.inspectPanel.hidden) return;
+  const inside = el.inspectPanel.contains(document.activeElement);
   el.inspectPanel.hidden = true;
   S.inspect = null;
   S.dirty = true;
+  if (inside) focusBack(S.inspectReturn);
+  S.inspectReturn = null;
 }
 
 function ago(ms) {
@@ -695,12 +1170,18 @@ function ago(ms) {
   return Math.floor(s / 86400) + 'd ago';
 }
 
-async function inspectCell(x, y) {
+// takeFocus is set only when the question was asked from the keyboard. A
+// shift-click has to leave the pointer user's focus where it was — yanking it
+// into a panel would mean their next arrow key no longer moved the cursor.
+async function inspectCell(x, y, takeFocus) {
+  const wasOpen = !el.inspectPanel.hidden;
   S.inspect = { x, y };
   S.dirty = true;
   el.inspectPanel.hidden = false;
   el.inspectTitle.textContent = 'cell ' + x + ', ' + y;
   el.inspectBody.textContent = 'looking…';
+  if (!wasOpen) S.inspectReturn = document.activeElement;
+  if (takeFocus) el.inspectPanel.focus();
 
   let data;
   try {
@@ -709,6 +1190,7 @@ async function inspectCell(x, y) {
     if (!res.ok) throw new Error(data.error || 'could not read that cell');
   } catch (e) {
     el.inspectBody.textContent = e.message;
+    saySelf(e.message);
     return;
   }
   if (!S.inspect || S.inspect.x !== x || S.inspect.y !== y) return;  // moved on
@@ -720,8 +1202,17 @@ async function inspectCell(x, y) {
     p.className = 'muted';
     p.textContent = 'Nobody has painted here. This is the canvas as it started.';
     el.inspectBody.appendChild(p);
+    saySelf('Cell ' + x + ', ' + y + '. Nobody has painted here.');
     return;
   }
+
+  // The panel is a list somebody has to go and read; the answer to the question
+  // they asked is the first line of it, so that is what gets said.
+  const top = history[0];
+  const who = data.you && top.uid === data.you ? 'you' : 'painter ' + top.uid.slice(0, 6);
+  saySelf('Cell ' + x + ', ' + y + '. ' + colourName(top.c) + ', painted by ' + who + ' ' +
+    ago(top.t) + '. ' + history.length + ' entr' + (history.length === 1 ? 'y' : 'ies') +
+    ' in this cell’s history.');
 
   // Built as nodes rather than markup. Painter ids come from the server and are
   // hex, but the moment history includes anything a person chose, an innerHTML
@@ -889,6 +1380,7 @@ function handleBinary(buf) {
     o += 5;
     if (!S.lapse) writePixel(x, y, c);
     if (i === 0) pushFeed(x, y, c);
+    notePlacement(x, y, c);
     S.placements++;
   }
   el.statPlacements.textContent = fmt(S.placements);
@@ -902,10 +1394,10 @@ function handleJSON(raw) {
     case 'hello':
       S.seq = msg.seq || 0;
       if (msg.uid) S.uid = msg.uid;
-      if (typeof msg.clients === 'number') el.statClients.textContent = fmt(msg.clients);
+      notePresence(msg.clients);
       break;
     case 'presence':
-      el.statClients.textContent = fmt(msg.n);
+      notePresence(msg.n);
       break;
     case 'cursors':
       // The room broadcasts every cursor, ours included. Drawing our own would
@@ -917,6 +1409,7 @@ function handleJSON(raw) {
       (msg.p || []).forEach((p, i) => {
         if (!S.lapse) writePixel(p.x, p.y, p.c);
         if (i === 0) pushFeed(p.x, p.y, p.c);
+        notePlacement(p.x, p.y, p.c);
         S.placements++;
         S.seq = Math.max(S.seq, p.s || 0);
       });
@@ -1013,7 +1506,7 @@ async function loadStats() {
     const j = await res.json();
     S.placements = j.placements || 0;
     el.statPlacements.textContent = fmt(S.placements);
-    el.statClients.textContent = fmt(j.clients);
+    notePresence(j.clients);
     return j;
   } catch (e) { /* stats are cosmetic */ }
 }
@@ -1032,7 +1525,11 @@ async function startTimelapse() {
     return;
   }
   if (!entries.length) {
-    toast('no history recorded yet' + (el.ephemeralBadge.hidden ? '' : ' (no database attached)'), 'warn');
+    // There is no ephemeral badge on this page - that lives on the home page -
+    // so reading one threw a TypeError here and the toast never appeared:
+    // pressing "time-lapse" on a canvas nobody had painted on did nothing at
+    // all, silently, which is the worst of the available outcomes.
+    toast('no history recorded yet', 'warn');
     return;
   }
   S.lapse = { entries, index: entries.length, playing: false, live: S.pixels.slice() };
@@ -1083,9 +1580,34 @@ function lapseStep() {
 
 // ---------------------------------------------------------------- sheets --
 
+// While a modal sheet is open the rest of the page stops existing: not
+// focusable, not clickable, not in the accessibility tree. Without this the
+// dialog is a visual effect — a screen reader reads straight past it into the
+// page behind and the user answers a question they cannot see. The live regions
+// and the toast are kept alive because the sheet's own buttons talk through
+// them.
+const KEEP_LIVE = ['sheet', 'toast', 'srSelf', 'srPeers'];
+function setBackgroundInert(on) {
+  [...document.body.children].forEach((node) => {
+    if (KEEP_LIVE.indexOf(node.id) >= 0) return;
+    node.inert = on;
+  });
+}
+
 function openSheet(html) {
+  const opening = el.sheet.hidden;
+  if (opening) S.sheetReturn = document.activeElement;
   el.sheetBody.innerHTML = html;
+  // The dialog is named by whatever heading the sheet just built, so the first
+  // thing announced is which dialog this is.
+  const heading = el.sheetBody.querySelector('h2');
+  if (heading) heading.id = 'sheetTitle';
   el.sheet.hidden = false;
+  if (opening) setBackgroundInert(true);
+  // Focused on every call, not only the first: statsSheet and manageSheet
+  // replace their own contents once the fetch lands, and a dialog whose entire
+  // body has changed has to say so.
+  el.sheetInner.focus();
   el.sheetBody.querySelectorAll('[data-copy]').forEach((b) => {
     b.addEventListener('click', () => {
       const input = document.getElementById(b.dataset.copy);
@@ -1096,26 +1618,64 @@ function openSheet(html) {
     });
   });
 }
-function closeSheet() { el.sheet.hidden = true; }
+
+function closeSheet() {
+  if (el.sheet.hidden) return;
+  el.sheet.hidden = true;
+  setBackgroundInert(false);
+  const back = S.sheetReturn;
+  S.sheetReturn = null;
+  focusBack(back);
+}
 
 function helpSheet() {
   openSheet(`
     <h2>Pixelforge</h2>
     <p>A single canvas shared by everyone who has it open. Place a pixel and it
     appears on every other screen within about a tenth of a second.</p>
-    <h3>Controls</h3>
+    <h3>Painting with a mouse</h3>
     <table>
       <tr><td>Place a pixel</td><td>click</td></tr>
-      <tr><td>Pan</td><td>drag, or arrow keys</td></tr>
+      <tr><td>Pan</td><td>drag</td></tr>
       <tr><td>Zoom</td><td>scroll, or <kbd>+</kbd> <kbd>−</kbd></td></tr>
-      <tr><td>Fit to screen</td><td><kbd>F</kbd></td></tr>
-      <tr><td>Pick a colour</td><td><kbd>1</kbd>…<kbd>9</kbd> <kbd>0</kbd></td></tr>
       <tr><td>Eyedropper</td><td>hold <kbd>Alt</kbd> and click</td></tr>
       <tr><td>Who painted this?</td><td>hold <kbd>Shift</kbd> and click</td></tr>
+    </table>
+
+    <h3>Painting without one</h3>
+    <p>Tab to the canvas, or press the skip link at the very top. It has its own
+    cursor: the arrows move it, the view follows it, and the whole canvas is
+    reachable without touching a pointing device.</p>
+    <table>
+      <tr><td>Move the cursor</td><td><kbd>↑</kbd> <kbd>↓</kbd> <kbd>←</kbd> <kbd>→</kbd></td></tr>
+      <tr><td>Move ten cells</td><td>hold <kbd>Shift</kbd></td></tr>
+      <tr><td>Move ten rows</td><td><kbd>PgUp</kbd> <kbd>PgDn</kbd></td></tr>
+      <tr><td>Ends of the row</td><td><kbd>Home</kbd> <kbd>End</kbd></td></tr>
+      <tr><td>Corners of the canvas</td><td><kbd>Ctrl</kbd> <kbd>Home</kbd> / <kbd>End</kbd></td></tr>
+      <tr><td>Paint the cursor cell</td><td><kbd>Enter</kbd> or <kbd>Space</kbd></td></tr>
+      <tr><td>Pick up the colour under it</td><td><kbd>E</kbd></td></tr>
+      <tr><td>Who painted this?</td><td><kbd>I</kbd></td></tr>
+    </table>
+
+    <h3>Reading the canvas</h3>
+    <p>Three descriptions, spoken into a live region, for anybody who is not
+    looking at the grid.</p>
+    <table>
+      <tr><td>The eight cells around the cursor</td><td><kbd>R</kbd></td></tr>
+      <tr><td>The whole row, painted runs only</td><td><kbd>Shift</kbd> <kbd>R</kbd></td></tr>
+      <tr><td>Where the painted areas are</td><td><kbd>M</kbd></td></tr>
+    </table>
+
+    <h3>Everything else</h3>
+    <table>
+      <tr><td>Pick a colour</td><td><kbd>1</kbd>…<kbd>9</kbd> <kbd>0</kbd></td></tr>
+      <tr><td>Step through the palette</td><td><kbd>[</kbd> <kbd>]</kbd></td></tr>
+      <tr><td>Fit to screen</td><td><kbd>F</kbd></td></tr>
       <tr><td>Take back your last pixel</td><td><kbd>Ctrl</kbd>/<kbd>⌘</kbd> <kbd>Z</kbd></td></tr>
       <tr><td>Template overlay</td><td><kbd>T</kbd>, or drop an image</td></tr>
       <tr><td>Next cell to paint</td><td><kbd>N</kbd></td></tr>
       <tr><td>Hide the template</td><td><kbd>H</kbd></td></tr>
+      <tr><td>Move the template</td><td><kbd>P</kbd>, then the arrows</td></tr>
       <tr><td>Close a panel</td><td><kbd>Esc</kbd></td></tr>
     </table>
     <h3>Tracing an image</h3>
@@ -1169,9 +1729,13 @@ async function statsSheet() {
     <h3>Most used colours</h3>
     ${counts.map(([hex, n]) => `
       <div style="display:flex;align-items:center;gap:9px;margin:9px 0">
-        <span style="width:13px;height:13px;border-radius:3px;background:${hex};box-shadow:inset 0 0 0 1px rgba(255,255,255,.15);flex:none"></span>
+        <span aria-hidden="true" style="width:13px;height:13px;border-radius:3px;background:${hex};box-shadow:inset 0 0 0 1px rgba(255,255,255,.15);flex:none"></span>
         <div style="flex:1">
-          <div class="bar"><i style="width:${(n / maxCount) * 100}%;background:${hex}"></i></div>
+          <!-- The swatch and the bar are the colour and the number, drawn. The
+               name is the only part of this row that survives being read aloud,
+               and without it every row here is an unlabelled count. -->
+          <span class="sr-only">${escapeAttr(colourName(S.palette.indexOf(hex)))}</span>
+          <div class="bar" aria-hidden="true"><i style="width:${(n / maxCount) * 100}%;background:${hex}"></i></div>
         </div>
         <span style="font-family:var(--mono);font-size:11px;color:var(--text-dim);min-width:52px;text-align:right">${n.toLocaleString()}</span>
       </div>`).join('') || '<p>Nothing painted yet.</p>'}
@@ -1189,7 +1753,7 @@ function shareSheet() {
   openSheet(`
     <h2>Share this canvas</h2>
     <p>Anyone with the link can paint. Nothing to install and no account needed.</p>
-    <div class="copyrow"><input readonly id="shUrl" value="${escapeAttr(url)}"><button class="ghost" data-copy="shUrl">copy</button></div>
+    <div class="copyrow"><input readonly id="shUrl" aria-label="Link to this canvas" value="${escapeAttr(url)}"><button class="ghost" data-copy="shUrl">copy<span class="sr-only"> the link</span></button></div>
 
     <h3>Preview</h3>
     <p>This is what the link turns into when it is pasted into Slack, Discord or
@@ -1198,7 +1762,7 @@ function shareSheet() {
 
     <h3>Embed it</h3>
     <p>A read-only view that keeps syncing, for a wiki page or a stream overlay.</p>
-    <div class="copyrow"><input readonly id="shEmbed" value="${escapeAttr(embed)}"><button class="ghost" data-copy="shEmbed">copy</button></div>
+    <div class="copyrow"><input readonly id="shEmbed" aria-label="Embed code for this canvas" value="${escapeAttr(embed)}"><button class="ghost" data-copy="shEmbed">copy<span class="sr-only"> the embed code</span></button></div>
 
     <h3>Take it with you</h3>
     <div class="sheet-actions">
@@ -1349,6 +1913,140 @@ async function commitLock(a, b) {
 
 // ----------------------------------------------------------------- input --
 
+function typingInto(node) {
+  if (!node) return false;
+  const tag = node.tagName || '';
+  return tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || !!node.isContentEditable;
+}
+
+// The cell cursor answers to the arrows only when the canvas has focus, or when
+// nothing on the page does. Anywhere else the arrows belong to whatever is
+// focused — stepping through the palette, dragging the time-lapse slider — and
+// a canvas that grabbed them there would make every other control unusable.
+function canvasHasKeys() {
+  const a = document.activeElement;
+  return !a || a === el.board || a === document.body;
+}
+
+function onKey(e) {
+  // Escape first, and ahead of the typing guard: a dialog you cannot leave from
+  // inside its own text field is a dialog you are stuck in. One layer per
+  // press, outermost first, so a single Escape never closes something the
+  // person could not see was open.
+  if (e.key === 'Escape') {
+    if (!el.sheet.hidden) closeSheet();
+    else if (S.inspect) closeInspect();
+    else if (!el.tplPanel.hidden) closeTemplate();
+    else if (S.lapse) exitTimelapse();
+    return;
+  }
+  if ((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z')) {
+    e.preventDefault();
+    undoMine();
+    return;
+  }
+  // Typing into a control should type, not paint. Alt combinations belong to
+  // the browser and the operating system.
+  if (typingInto(e.target) || e.altKey) return;
+
+  if (canvasHasKeys() && S.pixels) {
+    const far = e.shiftKey ? 10 : 1;
+    // Positioning the template was drag-only, which made a feature of the
+    // product unreachable without a pointing device. While positioning is on
+    // the arrows move the template instead of the cursor, which is the same
+    // gesture without the hand.
+    if (S.tplMove && S.template && !e.ctrlKey && !e.metaKey) {
+      const step = { ArrowLeft: [-far, 0], ArrowRight: [far, 0], ArrowUp: [0, -far], ArrowDown: [0, far] }[e.key];
+      if (step) {
+        e.preventDefault();
+        S.template.setOffset(S.template.x + step[0], S.template.y + step[1]);
+        refreshTemplate();
+        S.dirty = true;
+        saySelf('Template at ' + S.template.x + ', ' + S.template.y + '.', SAY_SETTLE_MS);
+        return;
+      }
+    }
+    if (!e.ctrlKey && !e.metaKey) {
+      switch (e.key) {
+        case 'ArrowLeft':  e.preventDefault(); moveCursor(-far, 0); return;
+        case 'ArrowRight': e.preventDefault(); moveCursor(far, 0); return;
+        case 'ArrowUp':    e.preventDefault(); moveCursor(0, -far); return;
+        case 'ArrowDown':  e.preventDefault(); moveCursor(0, far); return;
+        // Nobody crosses five hundred cells one arrow press at a time. Ten rows
+        // a press, the ends of the row, and the corners of the canvas are the
+        // three distances that turn a big grid into somewhere you can travel.
+        case 'PageUp':     e.preventDefault(); moveCursor(0, -10); return;
+        case 'PageDown':   e.preventDefault(); moveCursor(0, 10); return;
+      }
+    }
+    if (e.key === 'Home' || e.key === 'End') {
+      e.preventDefault();
+      const toEnd = e.key === 'End';
+      if (!S.kb.cell) moveCursor(0, 0);
+      else if (e.ctrlKey || e.metaKey) jumpCursor(toEnd ? S.W - 1 : 0, toEnd ? S.H - 1 : 0);
+      else jumpCursor(toEnd ? S.W - 1 : 0, S.kb.cell.y);
+      return;
+    }
+  }
+
+  // Painting needs the canvas to actually hold focus, not merely for nothing
+  // else to. A screen reader in browse mode parks focus on <body> and uses
+  // Space to move down the page; painting a pixel because somebody was reading
+  // would be a genuinely bad surprise.
+  if (document.activeElement === el.board && (e.key === 'Enter' || e.key === ' ') &&
+      !e.ctrlKey && !e.metaKey && S.pixels) {
+    e.preventDefault();
+    if (!S.kb.cell) { moveCursor(0, 0); return; }
+    S.kb.shown = true;
+    S.dirty = true;
+    tryPlace(S.kb.cell.x, S.kb.cell.y);
+    return;
+  }
+
+  if (canvasHasKeys() && S.pixels && !e.ctrlKey && !e.metaKey) {
+    const at = S.kb.cell;
+    switch (e.key) {
+      case 'r': if (!at) { moveCursor(0, 0); return; } saySelf(describeAround(at.x, at.y)); return;
+      case 'R': if (!at) { moveCursor(0, 0); return; } saySelf(describeRow(at.y)); return;
+      case 'm': case 'M': saySelf(describeRegions()); return;
+      case 'e': case 'E':
+        if (!at) { moveCursor(0, 0); return; }
+        selectColor(colourAt(at.x, at.y));
+        return;
+      case 'i': case 'I':
+        if (!at) { moveCursor(0, 0); return; }
+        inspectCell(at.x, at.y, true);
+        return;
+    }
+  }
+
+  if (e.metaKey || e.ctrlKey) return;
+  if (e.key >= '0' && e.key <= '9' && e.key.length === 1) {
+    selectColor(e.key === '0' ? 10 : Number(e.key));
+    return;
+  }
+  switch (e.key) {
+    case 'f': case 'F': fitToScreen(); break;
+    case '+': case '=': zoomAt(1.25); break;
+    case '-': case '_': zoomAt(1 / 1.25); break;
+    // The digits reach ten colours. A twenty colour palette had the other ten
+    // available to a mouse and to nothing else.
+    case '[': selectColor((S.color + S.palette.length - 1) % S.palette.length); break;
+    case ']': selectColor((S.color + 1) % S.palette.length); break;
+    case 't': case 'T': el.tplPanel.hidden ? openTemplate() : closeTemplate(); break;
+    case 'n': case 'N': jumpToNextCell(); break;
+    case 'h': case 'H':
+      if (S.template) { el.btnTplToggle.click(); }
+      break;
+    // Positioning has to be switchable from the canvas, because that is where
+    // focus has to be for the arrows to reach the template at all.
+    case 'p': case 'P':
+      if (S.template && !el.tplPanel.hidden) { el.btnTplMove.click(); }
+      break;
+    case '?': helpSheet(); break;
+  }
+}
+
 function bindInput() {
   let dragging = false, moved = false, lastX = 0, lastY = 0, downX = 0, downY = 0;
   const pointers = new Map();
@@ -1403,6 +2101,11 @@ function bindInput() {
     if (changed) {
       el.coords.textContent = cell ? cell.x + ', ' + cell.y : '–, –';
       S.dirty = true;
+      // A caret drawn on a canvas somebody is using with a mouse is clutter, and
+      // worse, it is a second answer to "where would Enter paint". The pointer
+      // takes the cursor with it and stops drawing it; a key press brings it
+      // straight back, in the place the pointer left it.
+      if (cell) { S.kb.cell = cell; S.kb.shown = false; }
     }
     sendCursor(cell);
 
@@ -1461,15 +2164,15 @@ function bindInput() {
     if (e.altKey) { selectColor(S.pixels[cell.y * S.W + cell.x]); toast('picked ' + S.palette[S.color]); return; }
     // Shift turns a click into a question instead of a placement. Asking who
     // painted something must never risk painting over it.
-    if (e.shiftKey) { inspectCell(cell.x, cell.y); return; }
+    if (e.shiftKey) { inspectCell(cell.x, cell.y, false); return; }
     tryPlace(cell.x, cell.y);
   };
   el.stage.addEventListener('pointerup', endPointer);
   el.stage.addEventListener('pointercancel', (e) => { pointers.delete(e.pointerId); dragging = false; tplGrab = null; el.stage.classList.remove('panning'); });
   el.stage.addEventListener('pointerleave', () => {
     S.hover = null;
-    el.coords.textContent = '–, –';
-    sendCursor(null);
+    el.coords.textContent = S.kb.shown && S.kb.cell ? S.kb.cell.x + ', ' + S.kb.cell.y : '–, –';
+    sendCursor(S.kb.shown && S.kb.cell ? S.kb.cell : null);
     S.dirty = true;
   });
 
@@ -1486,39 +2189,7 @@ function bindInput() {
     selectColor(S.pixels[cell.y * S.W + cell.x]);
   });
 
-  window.addEventListener('keydown', (e) => {
-    if ((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z')) {
-      e.preventDefault();
-      undoMine();
-      return;
-    }
-    if (e.metaKey || e.ctrlKey) return;
-    // Typing into the template panel's controls should type, not paint.
-    const tag = (e.target && e.target.tagName) || '';
-    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
-    if (e.key === 'Escape') {
-      closeSheet();
-      if (S.inspect) closeInspect();
-      if (S.lapse) exitTimelapse();
-      return;
-    }
-    if (e.key >= '0' && e.key <= '9') { selectColor(e.key === '0' ? 10 : Number(e.key)); return; }
-    switch (e.key) {
-      case 'f': case 'F': fitToScreen(); break;
-      case '+': case '=': zoomAt(1.25); break;
-      case '-': case '_': zoomAt(1 / 1.25); break;
-      case 'ArrowLeft':  S.view.ox += 40; S.dirty = true; e.preventDefault(); break;
-      case 'ArrowRight': S.view.ox -= 40; S.dirty = true; e.preventDefault(); break;
-      case 'ArrowUp':    S.view.oy += 40; S.dirty = true; e.preventDefault(); break;
-      case 'ArrowDown':  S.view.oy -= 40; S.dirty = true; e.preventDefault(); break;
-      case 't': case 'T': el.tplPanel.hidden ? openTemplate() : closeTemplate(); break;
-      case 'n': case 'N': jumpToNextCell(); break;
-      case 'h': case 'H':
-        if (S.template) { el.btnTplToggle.click(); }
-        break;
-      case '?': helpSheet(); break;
-    }
-  });
+  window.addEventListener('keydown', onKey);
 
   window.addEventListener('resize', () => { resize(); });
 
@@ -1532,9 +2203,69 @@ function bindInput() {
   $('btnSheetClose').addEventListener('click', closeSheet);
   el.sheet.addEventListener('click', (e) => { if (e.target === el.sheet) closeSheet(); });
 
+  // Tab wraps inside the open dialog. The `inert` above already achieves this
+  // by leaving nothing else focusable in the document, but only in browsers
+  // that have it; this is the same guarantee spelled out, and it is the one a
+  // test can drive deterministically.
+  el.sheet.addEventListener('keydown', (e) => {
+    if (e.key !== 'Tab') return;
+    const items = focusables(el.sheetInner);
+    if (!items.length) { e.preventDefault(); el.sheetInner.focus(); return; }
+    const first = items[0], last = items[items.length - 1];
+    const active = document.activeElement;
+    if (e.shiftKey && (active === first || active === el.sheetInner)) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && active === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  });
+
+  // ---- the canvas as a control ----
+  el.board.addEventListener('focus', () => {
+    if (!S.pixels) return;
+    // :focus-visible is precisely the question being asked — did this focus
+    // arrive from a keyboard — and the browser has already answered it. A click
+    // that focuses the canvas must not flash a caret on the cell it landed on.
+    const viaKeyboard = el.board.matches(':focus-visible');
+    const at = S.kb.cell || cellInView();
+    setCursor(at.x, at.y, { quiet: true });
+    S.kb.shown = viaKeyboard;
+    if (S.kb.oriented) { announceCursor(0); return; }
+    // First arrival gets the shape of the place and how to move in it. Every
+    // arrival after that gets the cursor, because by then they know.
+    S.kb.oriented = true;
+    saySelf(describeRegions() + ' Cursor at ' + cellText(S.kb.cell.x, S.kb.cell.y) +
+      '. Arrow keys move it, Enter paints, R describes what is around it.');
+  });
+
+  // ---- palette ----
+  // A radio group is one tab stop and the arrows move inside it. Without this
+  // the twenty swatches were twenty stops, and the ones past the tenth had no
+  // keyboard route at all: the digits only reach ten.
+  el.palette.addEventListener('keydown', (e) => {
+    const n = S.palette.length;
+    if (!n) return;
+    let next = -1;
+    switch (e.key) {
+      case 'ArrowRight': case 'ArrowDown': next = (S.color + 1) % n; break;
+      case 'ArrowLeft': case 'ArrowUp': next = (S.color + n - 1) % n; break;
+      case 'Home': next = 0; break;
+      case 'End': next = n - 1; break;
+      default: return;
+    }
+    e.preventDefault();
+    selectColor(next);
+    el.palette.children[next].focus();
+  });
+
   el.btnTransport.addEventListener('click', () => {
     S.transport = S.transport === 'ws' ? 'sse' : 'ws';
     el.btnTransport.textContent = S.transport;
+    el.btnTransport.setAttribute('aria-label', S.transport === 'ws'
+      ? 'Realtime transport: WebSocket. Activate to switch to Server-Sent Events.'
+      : 'Realtime transport: Server-Sent Events. Activate to switch to WebSocket.');
     S.reconnectDelay = 500;
     toast('switched to ' + (S.transport === 'ws' ? 'WebSocket' : 'Server-Sent Events'));
     connect();
@@ -1545,10 +2276,9 @@ function bindInput() {
     el.tplPanel.hidden ? openTemplate() : closeTemplate();
   });
   $('btnTplClose').addEventListener('click', closeTemplate);
-  el.tplDrop.addEventListener('click', () => el.tplFile.click());
-  el.tplDrop.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.tplFile.click(); }
-  });
+  // The drop zone is a <label> around a real file input rather than a div with
+  // a click handler, so opening the picker with a pointer, with Enter and with
+  // Space are all the browser's job and none of them is reimplemented here.
   el.tplFile.addEventListener('change', () => loadTemplateFile(el.tplFile.files[0]));
   ['dragenter', 'dragover'].forEach((ev) => el.tplDrop.addEventListener(ev, (e) => {
     e.preventDefault();
@@ -1577,7 +2307,13 @@ function bindInput() {
   el.btnTplMove.addEventListener('click', () => {
     S.tplMove = !S.tplMove;
     el.btnTplMove.classList.toggle('on', S.tplMove);
-    toast(S.tplMove ? 'drag on the canvas to position the template' : 'positioning off');
+    el.btnTplMove.setAttribute('aria-pressed', String(S.tplMove));
+    toast(S.tplMove ? 'drag or use the arrow keys to position the template' : 'positioning off');
+    if (!S.tplMove) return;
+    // The arrows only reach the template while the canvas holds focus, so send
+    // focus there rather than leaving the mode switched on and inert.
+    el.board.focus();
+    saySelf('Positioning the template. The arrow keys move it; press P again to stop.');
   });
   $('btnTplNext').addEventListener('click', jumpToNextCell);
   el.btnTplToggle.addEventListener('click', () => {
@@ -1636,10 +2372,19 @@ function bindInput() {
 
 // ------------------------------------------------------------------- boot --
 
+// A boot that fails leaves an overlay over the whole page saying why. It is a
+// live region so the reason is spoken, and focus goes to it so that somebody
+// who arrived on the page by keyboard is not left tabbing around behind a
+// message they never heard.
+function bootFailed(message) {
+  el.bootMsg.className = 'error';
+  el.bootMsg.textContent = message;
+  el.bootMsg.focus();
+}
+
 async function boot() {
   if (!SLUG) {
-    el.bootMsg.className = 'error';
-    el.bootMsg.textContent = 'This page did not tell the client which canvas to load.';
+    bootFailed('This page did not tell the client which canvas to load.');
     return;
   }
   try {
@@ -1647,8 +2392,7 @@ async function boot() {
     if (!res.ok) throw new Error('config request failed: ' + res.status);
     S.cfg = await res.json();
   } catch (e) {
-    el.bootMsg.className = 'error';
-    el.bootMsg.textContent = 'Could not reach the server. ' + e.message;
+    bootFailed('Could not reach the server. ' + e.message);
     return;
   }
 
@@ -1676,10 +2420,15 @@ async function boot() {
   try {
     await loadSnapshot(false);
   } catch (e) {
-    el.bootMsg.className = 'error';
-    el.bootMsg.textContent = 'Could not load the canvas. ' + e.message;
+    bootFailed('Could not load the canvas. ' + e.message);
     return;
   }
+
+  // The canvas is a control now, so it needs a name that says what it is and
+  // how big it is. Its keys live in #canvasHelp, which aria-describedby points
+  // at, so this stays short enough to hear on every focus.
+  el.board.setAttribute('aria-label',
+    `Shared pixel canvas, ${S.room.width} by ${S.room.height} cells, ${S.palette.length} colours`);
 
   await loadStats();
   if (S.cooldownMs === 0) el.cooldownText.textContent = 'no limit';
@@ -1688,6 +2437,8 @@ async function boot() {
   connect();
   render();
   cooldownTick();
+  setInterval(digestPeers, DIGEST_MS);
+  S.booted = true;
 
   el.boot.classList.add('gone');
   setTimeout(() => { el.boot.hidden = true; }, 500);

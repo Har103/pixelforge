@@ -470,7 +470,10 @@ func (s *Server) handleCreateRoom(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		s.Log.Error("creating room", "err", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "could not create room"})
+		// 503, to match every other handler that fails because the database is
+		// unreachable. A 500 here told a monitor the application was broken when
+		// what was actually happening was an outage it would recover from.
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "could not create room"})
 		return
 	}
 
@@ -595,6 +598,11 @@ func placeError(err error) (int, string) {
 		return http.StatusForbidden, "you are blocked from this canvas"
 	case errors.Is(err, room.ErrLocked):
 		return http.StatusForbidden, "that area is locked by the owner"
+	case errors.Is(err, room.ErrRoomClosed):
+		// 503 rather than 500: nothing is wrong with the request, the canvas was
+		// released from memory between resolving it and painting on it. Sending
+		// the same pixel again resolves the slug afresh and lands it.
+		return http.StatusServiceUnavailable, "this canvas was just reloaded, try that pixel again"
 	default:
 		return http.StatusInternalServerError, "could not place pixel"
 	}

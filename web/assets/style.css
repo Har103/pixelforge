@@ -4,17 +4,38 @@
   --bg-raised: #181b26;
   --line:      #242938;
   --line-soft: #1b1f2b;
+  /* --line is 1.2:1 against every surface here. As a rule between two table
+     rows that is deliberate restraint; as the *only* edge a button or a text
+     field has it means the control is invisible, which WCAG 1.4.11 is about.
+     So interactive edges get their own token at 3.4:1 and decorative ones keep
+     the quiet grey. */
+  --line-strong: #666f88;
   --text:      #e7eaf3;
   --text-dim:  #8992ab;
-  --text-faint:#5a6379;
+  /* Was #5a6379, which came out at 3.1:1 on these backgrounds - fine to look at
+     and not readable if your eyes are older than the designer's. Every use of
+     it is small text, so it has to clear 4.5:1 rather than 3:1. */
+  --text-faint:#7d8799;
   --accent:    #3a86ff;
+  /* The same blue dark enough that white sits on it at 4.5:1. --accent is a
+     4.9:1 foreground on our own dark surfaces, which is what it is used for
+     everywhere else; it is only as a *background* behind white that it fails. */
+  --accent-ink:#2f6fd9;
+  --accent-ink-hover:#3a7ae0;
   --accent-2:  #ff4d6d;
   --good:      #2a9d8f;
   --warn:      #ff9f1c;
   --bad:       #d90429;
+  /* Red as text. --bad is a fill and a border colour; on a panel it reads at
+     3.3:1, which is not enough for the error messages that used it. */
+  --bad-text:  #ff8080;
   --radius:    10px;
   --dock-h:    84px;
   --top-h:     62px;
+  /* White, because the focus ring has to be legible against twenty palette
+     colours as well as against the chrome, and white is the only value that is
+     never close to one of them on a background this dark. */
+  --focus:     #ffffff;
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
 }
@@ -25,6 +46,48 @@
    agent's [hidden] { display: none } rule - so a "hidden" overlay would still
    sit on top of the page swallowing every click. Restore the intent. */
 [hidden] { display: none !important; }
+
+/* -------------------------------------------------------- reaching things -- */
+
+/* Text for a screen reader and nobody else. Not display:none and not
+   visibility:hidden - both of those take it out of the accessibility tree as
+   well as off the screen, which is the opposite of the point. */
+.sr-only {
+  position: absolute; width: 1px; height: 1px;
+  margin: -1px; padding: 0; border: 0;
+  overflow: hidden; white-space: nowrap;
+  clip-path: inset(50%);
+}
+
+/* The first thing Tab reaches, and invisible until it is reached. Without it a
+   keyboard user pays for the whole header before every single canvas. */
+.skip-link {
+  position: fixed; top: 8px; left: 8px; z-index: 200;
+  background: var(--bg-raised); color: var(--text);
+  border: 1px solid var(--line-strong); border-radius: 8px;
+  padding: 10px 14px; font-size: 13px; text-decoration: none;
+  transform: translateY(-250%);
+}
+.skip-link:focus { transform: none; }
+
+/* One focus style for everything, rather than the one the drop zone used to
+   have to itself. :focus-visible rather than :focus so a mouse click does not
+   leave a ring behind, and an outline rather than a border or a shadow so it
+   cannot be overridden by a component that owns its own box-shadow - which the
+   selected palette swatch does. */
+a[href]:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+summary:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+/* The drop zone's own control is visually hidden so that it stays a real file
+   input, so the ring has to be drawn by the thing you can actually see. */
+.dropzone:focus-within { outline: 2px solid var(--focus); outline-offset: 2px; }
 
 html, body {
   margin: 0;
@@ -115,24 +178,35 @@ button { font-family: inherit; font-size: inherit; color: inherit; }
   background: var(--bg-raised);
 }
 .conn-dot {
-  width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint);
+  width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint);
   transition: background .25s, box-shadow .25s;
 }
 .conn-dot.live { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 22%, transparent); }
-.conn-dot.down { background: var(--bad); box-shadow: 0 0 0 3px color-mix(in srgb, var(--bad) 22%, transparent); }
+/* A square rather than a circle. Below 760px the written label is only there
+   for a screen reader, and a state told in colour alone is a state a
+   colour-blind person on a phone cannot read at all. */
+.conn-dot.down { background: var(--bad); border-radius: 1px; box-shadow: 0 0 0 3px color-mix(in srgb, var(--bad) 22%, transparent); }
 .conn-dot.wait { background: var(--warn); animation: blink 1s infinite; }
 @keyframes blink { 50% { opacity: .25 } }
 .conn-label { font-size: 11px; color: var(--text-dim); font-family: var(--mono); }
 
 button.ghost {
-  background: var(--bg-raised); border: 1px solid var(--line);
+  background: var(--bg-raised); border: 1px solid var(--line-strong);
   border-radius: 7px; padding: 6px 11px; cursor: pointer;
   color: var(--text-dim); font-size: 12px; font-family: var(--mono);
+  /* The fill of a ghost button is 1.1:1 against the bars it sits in, so its
+     border is the whole of what says "this is a control" - and a target under
+     24px is one a shaky hand or a thumb misses. */
+  min-height: 26px;
   transition: border-color .16s, color .16s, background .16s;
 }
-button.ghost:hover { border-color: #38405a; color: var(--text); background: #1d2130; }
+button.ghost:hover { border-color: #8892ab; color: var(--text); background: #1d2130; }
 button.ghost:active { transform: translateY(1px); }
-button.ghost.sq { padding: 6px 0; width: 30px; text-align: center; }
+/* flex: none, because `width` is only a starting size for a flex child. In the
+   time-lapse bar on a phone the play button was being shrunk to nine pixels
+   across - a target a third of the minimum, on the one device where the target
+   size is the whole problem. */
+button.ghost.sq { padding: 6px 0; width: 30px; flex: none; text-align: center; }
 button.ghost.on { border-color: var(--accent); color: var(--accent); }
 
 /* ----------------------------------------------------------------- stage -- */
@@ -154,6 +228,11 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
   box-shadow: 0 0 0 1px var(--line), 0 30px 90px -30px rgba(0,0,0,.9);
   background: #12141c;
 }
+/* The canvas element is the whole stage, so its focus ring is drawn inside its
+   own edges rather than around them; anything else would be off screen. The
+   cell cursor is drawn by the render loop, not here - it moves with the view
+   and has to be legible over twenty palette colours, which CSS cannot see. */
+#board:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
 
 .hud-left {
   position: absolute; left: 14px; bottom: 14px; z-index: 10;
@@ -161,14 +240,14 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
 }
 .coords {
   font-family: var(--mono); font-size: 12px; color: var(--text-dim);
-  background: color-mix(in srgb, var(--bg-panel) 85%, transparent);
+  background: color-mix(in srgb, var(--bg-panel) 96%, transparent);
   border: 1px solid var(--line); border-radius: 6px; padding: 4px 9px;
   backdrop-filter: blur(8px);
   font-variant-numeric: tabular-nums;
 }
 .zoombox {
   display: flex; align-items: center; gap: 5px;
-  background: color-mix(in srgb, var(--bg-panel) 85%, transparent);
+  background: color-mix(in srgb, var(--bg-panel) 96%, transparent);
   border: 1px solid var(--line); border-radius: 8px; padding: 4px;
   backdrop-filter: blur(8px);
 }
@@ -185,7 +264,7 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
 
 .feed {
   max-height: 42vh;
-  background: color-mix(in srgb, var(--bg-panel) 82%, transparent);
+  background: color-mix(in srgb, var(--bg-panel) 96%, transparent);
   border: 1px solid var(--line); border-radius: var(--radius);
   backdrop-filter: blur(10px);
   overflow: hidden;
@@ -215,11 +294,29 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
   position: absolute; left: 50%; transform: translateX(-50%); bottom: 14px; z-index: 12;
   display: flex; align-items: center; gap: 10px;
   padding: 8px 12px; width: min(560px, calc(100% - 28px));
-  background: color-mix(in srgb, var(--bg-panel) 92%, transparent);
+  background: color-mix(in srgb, var(--bg-panel) 96%, transparent);
   border: 1px solid var(--line); border-radius: var(--radius);
   backdrop-filter: blur(10px);
 }
-#scrub { flex: 1; accent-color: var(--accent); height: 4px; }
+/* The visible track stays 4px; the control does not. A 4px-tall slider is a
+   4px-tall target, which is a sixth of the WCAG 2.2 minimum and impossible to
+   grab on a touchscreen. The height goes on the input and the track is styled
+   back down inside it. */
+#scrub {
+  flex: 1; accent-color: var(--accent);
+  height: 24px; margin: 0; background: transparent;
+  -webkit-appearance: none; appearance: none;
+}
+#scrub::-webkit-slider-runnable-track { height: 4px; border-radius: 2px; background: var(--line-strong); }
+#scrub::-moz-range-track { height: 4px; border-radius: 2px; background: var(--line-strong); }
+#scrub::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 14px; height: 14px; margin-top: -5px; border: 0;
+  border-radius: 50%; background: var(--accent);
+}
+#scrub::-moz-range-thumb {
+  width: 14px; height: 14px; border: 0; border-radius: 50%; background: var(--accent);
+}
 .timelapse-label {
   font-family: var(--mono); font-size: 11px; color: var(--text-dim);
   min-width: 96px; text-align: right; font-variant-numeric: tabular-nums;
@@ -250,20 +347,30 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
 }
 
 .palette {
-  display: flex; gap: 6px; flex-wrap: wrap; flex: 1;
+  display: flex; gap: 8px; flex-wrap: wrap; flex: 1;
   justify-content: center; align-content: center;
 }
 .swatch {
   width: 30px; height: 30px; border-radius: 7px; cursor: pointer;
   border: 2px solid transparent; padding: 0;
-  box-shadow: inset 0 0 0 1px rgba(255,255,255,.08);
+  /* Outside the swatch, not inside it. The inset ring was 8% white, which the
+     dark end of every palette swallows: the background swatch of the Classic
+     palette is #12141c on a dock that is #11131b, so the control had no visible
+     edge whatsoever. A ring drawn on the dock instead is legible whatever
+     colour the swatch happens to be. */
+  box-shadow: 0 0 0 1px var(--line-strong);
   transition: transform .12s ease, border-color .12s;
 }
 .swatch:hover { transform: translateY(-2px) scale(1.06); }
+/* The selected swatch used to say so with a --text border drawn against the
+   colour itself, which is invisible on the white swatch and nearly so on the
+   pale ones. A dark ring and then a light one, both outside the swatch, read
+   against the dock rather than against the colour, so the state survives
+   whichever colour is chosen. */
 .swatch.sel {
   border-color: var(--text);
   transform: translateY(-3px) scale(1.1);
-  box-shadow: inset 0 0 0 1px rgba(0,0,0,.4), 0 6px 18px -6px rgba(0,0,0,.9);
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--text), 0 6px 18px -6px rgba(0,0,0,.9);
 }
 
 .dock-actions { display: flex; gap: 8px; flex: none; }
@@ -276,7 +383,7 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
 .panel {
   z-index: 14;
   width: 234px; max-height: calc(100% - 28px);
-  background: color-mix(in srgb, var(--bg-panel) 92%, transparent);
+  background: color-mix(in srgb, var(--bg-panel) 96%, transparent);
   border: 1px solid var(--line); border-radius: var(--radius);
   backdrop-filter: blur(12px);
   box-shadow: 0 20px 60px -24px rgba(0,0,0,.9);
@@ -295,7 +402,7 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
 .panel-body { padding: 11px 12px 13px; overflow-y: auto; font-size: 12px; }
 .panel-err {
   margin: 10px 0 0; font-size: 11.5px; line-height: 1.5;
-  color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent);
+  color: var(--bad-text); background: color-mix(in srgb, var(--bad) 12%, transparent);
   border: 1px solid color-mix(in srgb, var(--bad) 35%, transparent);
   border-radius: 6px; padding: 7px 9px;
 }
@@ -305,13 +412,12 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: 4px; text-align: center; cursor: pointer;
   padding: 20px 12px; border-radius: 8px;
-  border: 1.5px dashed var(--line);
+  border: 1.5px dashed var(--line-strong);
   transition: border-color .15s, background .15s;
 }
-.dropzone:hover, .dropzone:focus-visible, .dropzone.over {
+.dropzone:hover, .dropzone.over {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 9%, transparent);
-  outline: none;
 }
 .dropzone-title { font-size: 12.5px; color: var(--text); }
 .dropzone-sub { font-size: 10.5px; color: var(--text-faint); line-height: 1.45; }
@@ -320,11 +426,14 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
 .panel .row-label { font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .6px; }
 .panel .row.btns { gap: 6px; }
 .panel .row.btns > * { flex: 1; }
-.panel .row.check { justify-content: flex-start; cursor: pointer; color: var(--text-dim); font-size: 11.5px; line-height: 1.4; }
+/* The checkbox itself is 13px, well under the 24px minimum, but the label is
+   the target - clicking anywhere on it toggles the box - so the label is what
+   has to be big enough. */
+.panel .row.check { justify-content: flex-start; cursor: pointer; color: var(--text-dim); font-size: 11.5px; line-height: 1.4; min-height: 24px; }
 .panel .row.check input { accent-color: var(--accent); flex: none; }
 .sel-input {
-  background: var(--bg-raised); border: 1px solid var(--line); border-radius: 6px;
-  padding: 5px 7px; font-size: 11.5px; max-width: 132px;
+  background: var(--bg-raised); border: 1px solid var(--line-strong); border-radius: 6px;
+  padding: 5px 7px; font-size: 11.5px; max-width: 132px; min-height: 26px;
 }
 .tpl-progress { margin: 12px 0 11px; }
 .tpl-progress-top { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-dim); }
@@ -428,13 +537,23 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
   /* The minimap would sit under the taller dock and behind the time-lapse bar,
      and on a phone the canvas is rarely bigger than the screen anyway. */
   .minimap { display: none; }
-  .conn-label { display: none; }
+  /* Visually hidden rather than display:none. The dot is the only thing left
+     saying whether the canvas is live, and display:none would take the words
+     out of the accessibility tree as well as off the screen - leaving a screen
+     reader user on a phone with no way at all to know the connection dropped. */
+  .conn-label {
+    position: absolute; width: 1px; height: 1px;
+    margin: -1px; padding: 0; border: 0;
+    overflow: hidden; white-space: nowrap; clip-path: inset(50%);
+  }
   .conn { padding: 6px 8px; }
   .topbar-stats { gap: 12px; }
   .stat-value { font-size: 13px; }
   .dock { flex-wrap: wrap; padding: 10px 12px; gap: 10px; align-content: center; }
-  .palette { order: -1; flex-basis: 100%; gap: 5px; }
-  .swatch { width: 26px; height: 26px; border-radius: 6px; }
+  .palette { order: -1; flex-basis: 100%; gap: 6px; }
+  /* 26px cleared the 24px minimum by two pixels, which is not a margin - it is
+     a rounding error away from failing. A thumb is nine millimetres wide. */
+  .swatch { width: 28px; height: 28px; border-radius: 6px; }
   .hud-left { left: 10px; bottom: 10px; }
 }
 
@@ -473,7 +592,21 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+  /* Shortening the duration is not enough for the animations that loop. The
+     boot grid, the reconnecting dot and the browse page's loading skeletons all
+     run `infinite`, so a duration of .01ms did not stop them - it restarted
+     them every frame, which is a faster flicker than the animation it replaced
+     and exactly the thing somebody sets this preference to avoid. Ending after
+     one iteration parks each of them on its resting keyframe instead. */
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
+  }
+  /* The swatch lift and the room card's rise are transforms held by :hover, so
+     the transition-duration above removes the travel but leaves the jump. */
+  .swatch:hover, .swatch.sel, .room-card:hover { transform: none; }
 }
 
 /* ==========================================================================
@@ -512,23 +645,31 @@ main { max-width: 1080px; margin: 0 auto; padding: 0 24px 80px; }
 .hero-actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 .hero-note { margin: 18px 0 0; font-size: 13px; color: var(--text-faint); font-family: var(--mono); }
 
+/* --accent-ink rather than --accent, and an explicit hover colour rather than
+   a brightness filter: white on #3a86ff is 3.5:1, and brightening it on hover
+   made the label harder to read the moment you reached for it. */
 button.primary, .primary.linkish {
-  background: var(--accent); border: 1px solid var(--accent); color: #fff;
+  background: var(--accent-ink); border: 1px solid var(--accent-ink); color: #fff;
   border-radius: 9px; padding: 11px 20px; cursor: pointer; font-size: 14px;
   font-weight: 560; text-decoration: none; display: inline-block;
-  transition: filter .15s, transform .1s;
+  transition: background .15s, border-color .15s, transform .1s;
 }
-button.primary:hover, .primary.linkish:hover { filter: brightness(1.12); }
+button.primary:hover, .primary.linkish:hover {
+  background: var(--accent-ink-hover); border-color: var(--accent-ink-hover);
+}
 button.primary:active { transform: translateY(1px); }
-button.primary:disabled { opacity: .45; cursor: not-allowed; filter: none; }
+/* A disabled control is exempt from the contrast rules, but "you cannot use
+   this" still has to be legible enough to read the reason next to it. */
+button.primary:disabled { opacity: .6; cursor: not-allowed; }
 button.danger {
   background: color-mix(in srgb, var(--bad) 16%, transparent);
-  border: 1px solid color-mix(in srgb, var(--bad) 50%, var(--line));
-  color: #ff8080; border-radius: 8px; padding: 9px 16px; cursor: pointer; font-size: 13px;
+  border: 1px solid color-mix(in srgb, var(--bad) 50%, var(--line-strong));
+  color: var(--bad-text); border-radius: 8px; padding: 9px 16px; cursor: pointer; font-size: 13px;
+  min-height: 26px;
 }
 button.danger:hover { background: color-mix(in srgb, var(--bad) 26%, transparent); }
 .ghost.linkish { text-decoration: none; display: inline-block; }
-.ghost.sm { font-size: 11px; padding: 5px 9px; }
+.ghost.sm { font-size: 11px; padding: 6px 9px; min-height: 24px; }
 
 /* ----------------------------------------------------------- the creator -- */
 
@@ -545,39 +686,42 @@ button.danger:hover { background: color-mix(in srgb, var(--bad) 26%, transparent
   color: var(--text-faint); margin-bottom: 8px;
 }
 .field input[type=text], .field input[type=password] {
-  width: 100%; background: var(--bg); border: 1px solid var(--line);
+  width: 100%; background: var(--bg); border: 1px solid var(--line-strong);
   border-radius: 8px; padding: 10px 13px; color: var(--text); font-size: 14px;
   font-family: inherit;
 }
-.field input:focus { outline: none; border-color: var(--accent); }
+/* The accent border alone is a state change of about 1.4:1 against the border
+   it replaces, so it is a nice touch rather than a focus indicator. The global
+   :focus-visible outline is the indicator; this keeps the nice touch. */
+.field input:focus { border-color: var(--accent); }
 
 .chips { display: flex; gap: 8px; flex-wrap: wrap; }
 .chip {
-  background: var(--bg-raised); border: 1px solid var(--line); border-radius: 8px;
+  background: var(--bg-raised); border: 1px solid var(--line-strong); border-radius: 8px;
   padding: 9px 13px; cursor: pointer; color: var(--text-dim); font-size: 13px;
   display: flex; flex-direction: column; gap: 2px; align-items: flex-start;
   transition: border-color .15s, color .15s;
 }
 .chip strong { font-weight: 560; color: inherit; }
 .chip span { font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
-.chip:hover { border-color: #38405a; color: var(--text); }
+.chip:hover { border-color: #8892ab; color: var(--text); }
 .chip.on { border-color: var(--accent); color: var(--text); background: color-mix(in srgb, var(--accent) 10%, var(--bg-raised)); }
 
 .palettes { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 9px; }
 .palette-card {
-  background: var(--bg-raised); border: 1px solid var(--line); border-radius: 9px;
+  background: var(--bg-raised); border: 1px solid var(--line-strong); border-radius: 9px;
   padding: 9px; cursor: pointer; text-align: left; transition: border-color .15s;
 }
-.palette-card:hover { border-color: #38405a; }
-.palette-card.on { border-color: var(--accent); }
+.palette-card:hover { border-color: #8892ab; }
+.palette-card.on { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
 .palette-strip { display: flex; height: 18px; border-radius: 4px; overflow: hidden; }
 .palette-strip i { flex: 1; }
 .palette-name { display: block; margin-top: 7px; font-size: 12px; color: var(--text-dim); }
 
-.check { display: flex; align-items: flex-start; gap: 9px; font-size: 13px; color: var(--text-dim); margin-bottom: 20px; cursor: pointer; }
+.check { display: flex; align-items: flex-start; gap: 9px; font-size: 13px; color: var(--text-dim); margin-bottom: 20px; cursor: pointer; min-height: 24px; }
 .check input { margin-top: 2px; accent-color: var(--accent); }
 .hint { font-size: 12px; color: var(--text-faint); margin: 8px 0 0; line-height: 1.5; }
-.error { color: #ff8080; font-size: 13px; margin: 12px 0 0; }
+.error { color: var(--bad-text); font-size: 13px; margin: 12px 0 0; }
 .creator-actions, .sheet-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
 
 /* ------------------------------------------------------------ room cards -- */
@@ -651,7 +795,7 @@ body.is-paused #board { filter: saturate(.55) brightness(.85); }
 
 .copyrow { display: flex; gap: 8px; margin: 10px 0 4px; }
 .copyrow input {
-  flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--line);
+  flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--line-strong);
   border-radius: 8px; padding: 9px 12px; color: var(--text-dim);
   font-family: var(--mono); font-size: 12px;
 }
@@ -665,7 +809,7 @@ table.painters td:nth-child(2) { text-align: right; padding-right: 12px; color: 
 table.painters td em { color: var(--accent); font-style: normal; }
 .painter-actions { text-align: right; white-space: nowrap; }
 .painter-actions button { margin-left: 6px; }
-.danger-head { color: #ff8080 !important; }
+.danger-head { color: var(--bad-text) !important; }
 
 /* ----------------------------------------------------------------- embed -- */
 
@@ -675,7 +819,7 @@ body.embed { overflow: hidden; background: #0a0b10; }
 .embed-badge {
   position: fixed; left: 10px; bottom: 10px; z-index: 5;
   display: flex; align-items: center; gap: 8px; text-decoration: none;
-  background: color-mix(in srgb, var(--bg-panel) 86%, transparent);
+  background: color-mix(in srgb, var(--bg-panel) 96%, transparent);
   border: 1px solid var(--line); border-radius: 20px; padding: 6px 12px;
   backdrop-filter: blur(8px); font-size: 11.5px; color: var(--text-dim);
 }

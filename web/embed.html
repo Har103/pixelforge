@@ -9,12 +9,19 @@
 </head>
 <body class="embed" data-slug="{{ROOM_SLUG}}">
   <main class="embed-stage" id="stage">
-    <canvas id="board" aria-label="Shared pixel canvas, read only"></canvas>
+    <!-- A framed document with no heading gives a screen reader nothing to say
+         about what it just landed in. -->
+    <h1 class="sr-only">{{ROOM_NAME}} — a shared pixel canvas</h1>
+    <!-- role=img, because a bare <canvas> has no implicit role and an
+         aria-label on a roleless element is a label on nothing. The embed is
+         read only, so a picture is exactly what it is. -->
+    <canvas id="board" role="img" aria-label="Live view of the {{ROOM_NAME}} pixel canvas. Read only."></canvas>
   </main>
   <a class="embed-badge" id="embedLink" href="/r/{{ROOM_SLUG}}" target="_blank" rel="noopener">
     <span class="brand-mark sm" aria-hidden="true"></span>
     <span class="embed-name">{{ROOM_NAME}}</span>
-    <span class="embed-cta">paint →</span>
+    <span class="embed-cta" aria-hidden="true">paint →</span>
+    <span class="sr-only">— open this canvas and paint on it, in a new tab</span>
   </a>
 <script src="/assets/embed.js"></script>
 </body>

@@ -172,7 +172,7 @@ func (r *Registry) Get(ctx context.Context, slug string) (*Room, error) {
 		if err != nil {
 			return nil, err
 		}
-		r.evictIfCrowded()
+		r.evictIfCrowded(rm)
 		return rm, nil
 	}
 }
@@ -246,6 +246,17 @@ func (r *Registry) materialise(ctx context.Context, meta store.Room) (*Room, err
 		rm.bans = bans
 	}
 
+	if rects, err := r.store.Locks(ctx, meta.ID); err == nil {
+		rm.locks = make([]Lock, len(rects))
+		for i, l := range rects {
+			rm.locks[i] = Lock{X1: l.X1, Y1: l.Y1, X2: l.X2, Y2: l.Y2}
+		}
+	} else {
+		// Loading a room without its locks would present a protected area as
+		// paintable, so say so loudly rather than let it look intentional.
+		r.log.Error("loading room locks", "room", meta.Slug, "err", err)
+	}
+
 	rm.run()
 	r.log.Info("room resident", "room", meta.Slug,
 		"size", fmt.Sprintf("%dx%d", meta.Width, meta.Height),
@@ -298,19 +309,47 @@ func (r *Registry) Create(ctx context.Context, spec Spec) (*Room, error) {
 	r.mu.Lock()
 	r.rooms[meta.Slug] = rm
 	r.mu.Unlock()
-	r.evictIfCrowded()
+	r.evictIfCrowded(rm)
 	return rm, nil
 }
 
-// evictIfCrowded drops the idlest rooms when too many are resident.
-func (r *Registry) evictIfCrowded() {
+// evictIfCrowded drops the idlest room when too many are resident. keep is the
+// room that was just loaded, which is never a candidate for its own eviction.
+//
+// A room with somebody connected is never a candidate either, which is the same
+// rule sweep applies and for a much sharper reason here. Evicting an occupied
+// room stops the loop that persists its placements while every open socket
+// carries on painting into it, so their pixels are accepted, broadcast to each
+// other, and never written down - and the next visitor resolves the slug to a
+// second, freshly loaded room that has never heard of any of it. Two live rooms
+// for one canvas, one of them writing to nowhere.
+//
+// keep exists because of that exclusion rather than in spite of it. A brand new
+// room has nobody in it yet, so on a server whose other rooms are all occupied
+// it is the only thing left to evict - and the caller would be handed back a
+// canvas that was closed before they saw it.
+//
+// The consequence is that the cap is a target rather than a guarantee: a server
+// with more occupied rooms than the cap will exceed it. That is the right way
+// round. The cap exists to bound memory, and disconnecting people who are
+// mid-brushstroke to honour a memory target is a worse outcome than the memory.
+// It is logged so an operator can see it happening rather than guess.
+func (r *Registry) evictIfCrowded(keep *Room) {
 	r.mu.Lock()
 	if len(r.rooms) <= r.maxRooms {
 		r.mu.Unlock()
 		return
 	}
 	var idlest *Room
+	occupied := 0
 	for _, rm := range r.rooms {
+		if rm == keep {
+			continue
+		}
+		if rm.Hub.Count() > 0 {
+			occupied++
+			continue
+		}
 		if idlest == nil || rm.Idle() > idlest.Idle() {
 			idlest = rm
 		}
@@ -318,12 +357,16 @@ func (r *Registry) evictIfCrowded() {
 	if idlest != nil {
 		delete(r.rooms, idlest.Meta.Slug)
 	}
+	resident := len(r.rooms)
 	r.mu.Unlock()
 
-	if idlest != nil {
-		r.log.Info("evicting room to stay under the resident cap", "room", idlest.Meta.Slug)
-		idlest.stop()
+	if idlest == nil {
+		r.log.Warn("over the resident room cap and every room has somebody in it",
+			"resident", resident, "cap", r.maxRooms, "occupied", occupied)
+		return
 	}
+	r.log.Info("evicting room to stay under the resident cap", "room", idlest.Meta.Slug)
+	idlest.stop()
 }
 
 // Run sweeps idle rooms out of memory until ctx is cancelled, then shuts every

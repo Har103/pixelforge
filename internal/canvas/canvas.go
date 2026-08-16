@@ -130,6 +130,12 @@ func (c *Canvas) Apply(x, y int, colour uint8, seq int64) {
 
 // CooldownRemaining reports how long uid must wait before its next placement.
 func (c *Canvas) CooldownRemaining(uid string, now time.Time) time.Duration {
+	// "No cooldown" is a real choice in the room creation form, and it has to
+	// mean no cooldown here rather than a cooldown of zero length that the
+	// arithmetic below might still find somebody inside of. See Place.
+	if c.cooldown <= 0 {
+		return 0
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	last, ok := c.lastPlace[uid]
@@ -154,9 +160,23 @@ func (c *Canvas) Place(x, y int, colour uint8, uid string, now time.Time) (Pixel
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if last, ok := c.lastPlace[uid]; ok {
-		if elapsed := now.Sub(last); elapsed < c.cooldown {
-			return Pixel{}, ErrCooldown
+	// A canvas with no cooldown is not a canvas with a zero-length one, and the
+	// difference is not academic. now is read by the caller before it queues for
+	// this lock, so two placements by one painter can arrive in the opposite
+	// order to the clock readings they carry - and a negative elapsed is less
+	// than a cooldown of zero. That handed ErrCooldown, which the client shows
+	// as "you are painting too fast", to painters in a room whose whole selling
+	// point was that it had no cooldown.
+	//
+	// Skipping the bookkeeping as well as the check is deliberate: the cooldown
+	// is fixed when the canvas is built, so on a room that has none, lastPlace
+	// can never be read, and every entry in it would be an idle painter's id
+	// held in memory for nothing.
+	if c.cooldown > 0 {
+		if last, ok := c.lastPlace[uid]; ok {
+			if elapsed := now.Sub(last); elapsed < c.cooldown {
+				return Pixel{}, ErrCooldown
+			}
 		}
 	}
 	idx := y*c.width + x
@@ -168,8 +188,10 @@ func (c *Canvas) Place(x, y int, colour uint8, uid string, now time.Time) (Pixel
 
 	c.pixels[idx] = colour
 	c.seq++
-	c.lastPlace[uid] = now
-	c.pruneLocked(now)
+	if c.cooldown > 0 {
+		c.lastPlace[uid] = now
+		c.pruneLocked(now)
+	}
 
 	return Pixel{Seq: c.seq, X: x, Y: y, Color: colour, UID: uid, At: now}, nil
 }

@@ -87,6 +87,15 @@ needs, so tracing is click, click, click. The image is decoded in your browser
 and never uploaded: what you are copying is nobody else's business, least of all
 the server's.
 
+**Usable without a mouse.** The canvas takes focus and keeps a cell cursor:
+arrows move it, Shift moves ten, Home/End and Ctrl+Home/End cross a 500-cell
+canvas in five presses, Enter paints. Two live regions carry what you just did
+and what everybody else is doing — the second summarised on a timer, because
+announcing every remote pixel is as useless as announcing none. <kbd>R</kbd>
+describes the eight cells around you, <kbd>Shift</kbd>+<kbd>R</kbd> reads the
+row, <kbd>M</kbd> says where the painted areas are. "Everyone at once" is the
+product's claim; it should not have an asterisk on it.
+
 **Live, two ways.** WebSocket by default, with an automatic fallback to
 Server-Sent Events for networks that will not carry an upgrade; there is a
 toggle in the room so you can watch both paths work. Updates are coalesced on a
@@ -395,6 +404,34 @@ with `PIXELFORGE_E2E_CHROME`, or let it find one; with no browser anywhere it
 skips rather than fails, and CI pins the path explicitly so a silent skip cannot
 masquerade as a pass.
 
+**The load suite is real too.** `internal/loadtest` boots the server in-process
+and drives it over real HTTP and real WebSockets, with a TCP proxy — also
+stdlib — between the server and PostgreSQL so a test can add latency or cut the
+database outright. It is gated behind `PIXELFORGE_LOADTEST=1`, so it never slows
+CI down, but it is committed and anybody can re-run it:
+
+```sh
+PIXELFORGE_LOADTEST=1 PIXELFORGE_TEST_DSN=postgres://… \
+  go test ./internal/loadtest/ -run TestLoad -v -timeout 40m
+```
+
+On two cores it measured 13,000–18,000 placements/s over HTTP flat from 8 to 200
+painters, 500 simultaneous sockets with no leaked goroutines, and read latency
+unmoved (84–95 µs) while the database was given 100 ms of added latency. What
+degrades first is not CPU, the canvas lock or the fan-out — it is the
+write-behind queue, and the queue's real unit turns out to be *seconds of
+headroom*, not entries: 4096 entries is two seconds at 2,000 placements/s and
+137 ms at 30,000. **Numbers are from this container and are ceilings of it, not
+of the product. Reproduce the shapes, don't quote the figures.**
+
+Four bugs came out of that, all of them shipped, none of them findable any other
+way — an occupied room being evicted from memory while its sockets kept painting
+into it, a failed database write discarding its batch instead of retrying, the
+periodic snapshot being up to twenty seconds too late to rescue dropped history,
+and presence fan-out that was quadratic enough to disconnect 13,039 clients as
+"too slow" while 500 of them were merely joining. Each is described where it was
+fixed.
+
 It catches the class of bug that unit tests structurally cannot — every item
 here is a regression this project actually shipped:
 
@@ -436,6 +473,25 @@ Worth singling out:
 - `Migrate` takes a PostgreSQL advisory lock: `create table if not exists` is
   not atomic against a concurrent creator, so two replicas starting together —
   or two test binaries — could race and one would die on a duplicate key
+- `TestAnOccupiedRoomIsNeverEvicted` and `TestLocksSurviveTheRoomBeingReleased`
+  — the two ways a room could quietly lose something it had already accepted
+- `TestAWriteTheDatabaseRefusesIsRetriedRatherThanDiscarded` — an outage
+  simulated with a trigger rather than a cut cable, because the flush cannot
+  tell the difference and a trigger fires at an exact moment. Its first version
+  deleted the room's row instead, which proved nothing: `room_placements` has no
+  foreign key, so the writes succeeded and the test passed without testing
+  anything. Mutation testing is what caught that, which is the argument for it
+
+Coverage, after a deliberate pass at the packages that were carrying the most
+risk for the least testing:
+
+| package | before | after | |
+|---|---|---|---|
+| `internal/pg` | 30.3% | **96.2%** | the wire protocol, and all the data |
+| `internal/store` | 28.8% | **87.7%** | every SQL statement |
+| `internal/canvas` | 64.4% | **97.3%** | the grid itself |
+| `internal/hub` | 0% | **93.5%** | it was hiding a panic |
+| `internal/room` | 64.1% | **72.7%** | |
 - The WebSocket protocol-violation suite — unmasked frames, reserved bits,
   oversized control frames, invalid UTF-8, each expecting a specific close code
 
