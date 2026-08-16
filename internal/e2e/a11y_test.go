@@ -8,7 +8,10 @@
 package e2e
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -1599,4 +1602,119 @@ func TestRoomPageStructureIsAnnounceable(t *testing.T) {
 	}
 
 	p.requireQuietConsole(t)
+}
+
+// TestDocumentPagesActuallyScroll is a regression test for a bug that made the
+// browse page unusable and that every test in this suite walked straight past.
+//
+// The room and the embed are fixed application shells, so the stylesheet set
+// `overflow: hidden` on html and body for every page and let `body.page` opt the
+// ordinary documents back out with `overflow-y: auto`. That does not work. The
+// scrolling element is <html>, so hiding its overflow clips the document no
+// matter what body says, and a body sized to its own content never overflows
+// itself and so never grows a scrollbar of its own either. The home page had
+// 649 pixels below the fold that no gesture, key or scrollbar could reach - and
+// the more canvases people made, the more of the list was unreachable.
+//
+// Nothing caught it because no test had ever scrolled. Asserting on
+// scrollHeight alone would not have either: the content was all present and
+// correctly laid out, it simply could not be brought into view. So this scrolls
+// for real and checks the viewport moved.
+func TestDocumentPagesActuallyScroll(t *testing.T) {
+	dsn := testDSN(t)
+	browser := launchChrome(t)
+	srv := newServer(t, dsn)
+
+	// Enough *public* rooms that the browse grid is certain to run past the fold
+	// at this viewport, so the test does not rely on whatever else is there. The
+	// rest of this suite creates unlisted rooms; these have to be listed or the
+	// page has nothing to scroll.
+	api := newClient()
+	for i := 0; i < 12; i++ {
+		body, _ := json.Marshal(map[string]any{
+			"name": fmt.Sprintf("scroll filler %d", i), "width": 16, "height": 16,
+			"cooldownMs": 0, "unlisted": false,
+		})
+		res, err := api.Post(srv.URL+"/api/rooms", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("creating filler room %d: %v", i, err)
+		}
+		res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("creating filler room %d: status %d", i, res.StatusCode)
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		path string
+		v    viewport
+	}{
+		{"home, desktop", "/", desktopViewport},
+		{"home, phone", "/", phoneViewport},
+		{"not found", "/r/no-such-canvas-anywhere", desktopViewport},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := browser.newPage(t)
+			p.setViewport(t, tc.v)
+			p.navigate(t, srv.URL+tc.path)
+			p.settle(t)
+
+			overflow := p.evalFloat(t, `(function () {
+				const el = document.scrollingElement || document.documentElement;
+				return el.scrollHeight - el.clientHeight;
+			})()`)
+			if overflow < 40 {
+				t.Skipf("this page fits in the viewport (%.0fpx of overflow), so there is nothing to scroll", overflow)
+			}
+
+			// The root must not be a clipping box, whatever else is set.
+			if got := p.evalString(t,
+				`getComputedStyle(document.documentElement).overflowY`); got == "hidden" {
+				t.Errorf("html has overflow-y:%s, which clips the document: the %.0fpx below the fold cannot be reached by any means", got, overflow)
+			}
+
+			// And prove it by actually moving.
+			p.mustEval(t, `(document.scrollingElement || document.documentElement).scrollTop = 100000`)
+			p.settle(t)
+			after := p.evalFloat(t,
+				`(document.scrollingElement || document.documentElement).scrollTop`)
+			if after < overflow-2 {
+				t.Errorf("scrolled to %.0fpx of a possible %.0fpx; the bottom of the page is unreachable", after, overflow)
+			}
+
+			// A sideways scrollbar on a phone is its own bug, so rule it out
+			// while we are here.
+			if wide := p.evalFloat(t, `document.documentElement.scrollWidth`); wide > float64(tc.v.width)+1 {
+				t.Errorf("the document is %.0fpx wide in a %dpx viewport, so it scrolls sideways too", wide, tc.v.width)
+			}
+
+			p.requireQuietConsole(t)
+		})
+	}
+}
+
+// TestTheRoomShellDoesNotScroll is the other half of the same rule. The room is
+// a fixed shell: if it ever grows a scrollbar, something inside it has escaped
+// its box, and on a phone the whole page rubber-bands under a finger that meant
+// to drag the canvas.
+func TestTheRoomShellDoesNotScroll(t *testing.T) {
+	for _, v := range []viewport{desktopViewport, phoneViewport} {
+		s := openRoom(t, "No scrolling here", v)
+		p := s.page
+
+		if got := p.evalString(t,
+			`getComputedStyle(document.documentElement).overflowY`); got != "hidden" {
+			t.Errorf("at %dx%d the room's root has overflow-y:%s, want hidden: a canvas you drag must not drag the page with it",
+				v.width, v.height, got)
+		}
+		over := p.evalFloat(t, `(function () {
+			const el = document.scrollingElement || document.documentElement;
+			return el.scrollHeight - el.clientHeight;
+		})()`)
+		if over > 1 {
+			t.Errorf("at %dx%d the room shell overflows its viewport by %.0fpx, so something has escaped its box",
+				v.width, v.height, over)
+		}
+	}
 }

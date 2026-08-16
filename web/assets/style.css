@@ -92,7 +92,6 @@ summary:focus-visible,
 html, body {
   margin: 0;
   height: 100%;
-  overflow: hidden;
   background: var(--bg);
   color: var(--text);
   font-family: var(--sans);
@@ -100,6 +99,21 @@ html, body {
   -webkit-font-smoothing: antialiased;
   overscroll-behavior: none;
 }
+
+/* The room and the embed are fixed application shells - every part of them is
+   positioned, nothing is meant to scroll, and hiding the root's overflow is
+   what stops a phone rubber-banding the whole document while somebody is
+   dragging the canvas. The home, browse and 404 pages are ordinary documents
+   and have to scroll like ordinary documents.
+
+   This is opt-in, on <html>, and it used to be neither. Hiding overflow on
+   every page and letting body.page set overflow-y:auto to opt back out does not
+   work: the scrolling element is <html>, so a clipped root clips the document
+   no matter what body does, and body sized to its own content never overflows
+   itself and so never grows a scrollbar of its own. The browse page had 649
+   pixels below the fold that no amount of scrolling could reach, and the more
+   canvases people made the more of them were unreachable. */
+html.app, html.app > body { overflow: hidden; }
 
 button { font-family: inherit; font-size: inherit; color: inherit; }
 
@@ -617,7 +631,11 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
 /* The room page is a fixed, non-scrolling application shell; the marketing and
    browse pages are ordinary documents. body.page opts back into scrolling. */
 body.page {
-  overflow-y: auto;
+  /* No overflow-y here on purpose. The root scrolls these pages, and setting
+     overflow-y on body would make body a scroll container of its own - a second
+     scrollbar that nothing needs and that the browser will not give keyboard
+     focus to. overflow-x stays, so a wide element cannot introduce a sideways
+     scroll on a phone. */
   overflow-x: hidden;
   height: auto;
   min-height: 100%;
