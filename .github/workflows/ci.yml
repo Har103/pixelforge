@@ -189,5 +189,10 @@ jobs:
           load: true
           tags: pixelforge:ci
           build-args: VERSION=ci
+      # A block scalar, not a plain one. The colon-space inside the format
+      # string made YAML read this line as a second mapping key, which failed
+      # the whole workflow before a single job started - so every run since the
+      # first commit was red for a reason that had nothing to do with the code.
       - name: report image size
-        run: docker image inspect pixelforge:ci --format 'image size: {{.Size}} bytes'
+        run: |
+          docker image inspect pixelforge:ci --format 'image size: {{.Size}} bytes'
