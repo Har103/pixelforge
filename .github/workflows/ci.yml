@@ -97,13 +97,29 @@ jobs:
           for _ in $(seq 1 40); do curl -sf localhost:8080/readyz >/dev/null && break; sleep 0.5; done
 
           curl -sf localhost:8080/readyz
-          curl -sf -c /tmp/jar localhost:8080/api/config >/dev/null
+          # /api/palettes is what the creation form fetches first. It used to be
+          # /api/config, which was the single-canvas endpoint and stopped
+          # existing when rooms landed - a 404 that would have ended this job on
+          # its third line, and went unnoticed for four commits because the
+          # workflow file did not parse and none of this had ever run.
+          curl -sf -c /tmp/jar localhost:8080/api/palettes >/dev/null
           # Create a room through the API, paint in it, and check the exports.
+          # head -1 because the creation response carries the slug twice, once
+          # at the top level and once inside "room" - a convenience for callers
+          # that turned this into a two-line variable, and every URL below into
+          # a malformed one. The guard afterwards is so that the next time this
+          # extraction goes wrong it says so, instead of curl reporting an
+          # unexplained exit 3 eight lines later.
           SLUG=$(curl -sf -c /tmp/jar -X POST localhost:8080/api/rooms \
                  -H 'Content-Type: application/json' \
                  -d '{"name":"ci canvas","width":32,"height":32,"cooldownMs":0}' \
-                 | grep -o '"slug":"[^"]*"' | cut -d'"' -f4)
-          test -n "$SLUG"
+                 | grep -o '"slug":"[^"]*"' | head -1 | cut -d'"' -f4)
+          case "$SLUG" in
+            '' | *[!a-z0-9-]*)
+              echo "could not read a usable slug out of the creation response: '$SLUG'" >&2
+              exit 1
+              ;;
+          esac
           curl -sf -b /tmp/jar -X POST "localhost:8080/api/r/$SLUG/place" \
                -H 'Content-Type: application/json' -d '{"x":4,"y":5,"c":7}' >/dev/null
           sleep 1
