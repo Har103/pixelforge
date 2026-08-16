@@ -184,6 +184,44 @@ func nextPixelFrame(sub *hub.Subscriber, wait time.Duration) (canvas.Pixel, bool
 	}
 }
 
+// undoneFrame is how a retraction reaches clients. It is deliberately not a
+// "px" frame: an undo is not a placement, and a client that treated it as one
+// would count it in the room's placement total and drift one ahead of the
+// server on every undo.
+type undoneFrame struct {
+	T   string `json:"t"`
+	X   int    `json:"x"`
+	Y   int    `json:"y"`
+	C   uint8  `json:"c"`
+	UID string `json:"uid"`
+}
+
+func nextUndoneFrame(t *testing.T, sub *hub.Subscriber, wait time.Duration) (undoneFrame, bool) {
+	t.Helper()
+	deadline := time.After(wait)
+	for {
+		select {
+		case f, ok := <-sub.C:
+			if !ok {
+				return undoneFrame{}, false
+			}
+			var msg undoneFrame
+			if err := json.Unmarshal(f.Data, &msg); err != nil {
+				continue
+			}
+			if msg.T == "px" {
+				t.Error("the undo went out as a px frame, which every client will count as a placement")
+			}
+			if msg.T != "undone" {
+				continue
+			}
+			return msg, true
+		case <-deadline:
+			return undoneFrame{}, false
+		}
+	}
+}
+
 // ------------------------------------------------------------- undoing one --
 
 // TestUndoOwnRestoresTheColourUnderneath is the point of the whole feature. The
@@ -407,12 +445,15 @@ func TestUndoOwnReachesConnectedClients(t *testing.T) {
 		t.Fatalf("undo: %v", err)
 	}
 
-	px, ok := nextPixelFrame(sub, 3*time.Second)
+	msg, ok := nextUndoneFrame(t, sub, 3*time.Second)
 	if !ok {
 		t.Fatal("the undo was never broadcast, so every open tab still shows the pixel alec took back")
 	}
-	if px.X != 5 || px.Y != 5 || px.Color != 3 {
-		t.Errorf("broadcast pixel = (%d,%d) colour %d, want bess's 3 restored at (5,5)", px.X, px.Y, px.Color)
+	if msg.X != 5 || msg.Y != 5 || msg.C != 3 {
+		t.Errorf("broadcast = (%d,%d) colour %d, want bess's 3 restored at (5,5)", msg.X, msg.Y, msg.C)
+	}
+	if msg.UID != "alec" {
+		t.Errorf("broadcast uid = %q, want alec: a client needs to know whose pixel went", msg.UID)
 	}
 }
 

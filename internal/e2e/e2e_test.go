@@ -1253,10 +1253,33 @@ func TestUndoPutsBackWhatWasUnderneath(t *testing.T) {
 	s.waitForPixel(t, cellX, cellY, byte(mine), 10*time.Second)
 	s.waitForHistory(t, cellX, cellY, byte(mine), 15*time.Second)
 
+	// The headline counter before the undo, so the assertion below can be about
+	// what the undo did to it rather than about an absolute number.
+	before := p.evalString(t, `document.getElementById('statPlacements').textContent`)
+
 	// Ctrl+Z, because the shortcut is the way anybody actually undoes anything.
 	p.pressKey(t, "z", "KeyZ", 90, modCtrl)
 	s.waitForPixel(t, cellX, cellY, underneath, 10*time.Second)
 	s.requireCanvasShows(t, p, x, y, cellX, cellY, s.palette[underneath])
+
+	// An undo is a retraction, not a placement. The server stopped recording it
+	// as one, so a client that counts the broadcast drifts one ahead of every
+	// stats page and snaps back on the next reload - which is exactly what
+	// production did until the retraction got its own message.
+	p.settle(t)
+	if after := p.evalString(t, `document.getElementById('statPlacements').textContent`); after != before {
+		t.Errorf("the placement counter went from %s to %s across an undo; an undo is not a placement", before, after)
+	}
+
+	// The panel showing that cell's history has to notice, too. Leaving a
+	// retracted pixel on screen looking current is worse than not offering the
+	// history at all.
+	p.modClickAt(t, x, y, modShift)
+	p.waitFor(t, `!document.getElementById('inspectPanel').hidden &&
+		document.querySelectorAll('#inspectBody .history li').length > 0`, 10*time.Second)
+	if got := p.evalInt(t, `document.querySelectorAll('#inspectBody .history li.undone').length`); got < 1 {
+		t.Errorf("the cell's history shows %d retracted entries, want at least the pixel just undone", got)
+	}
 
 	// The cooldown is gone: taking back a misclick must not cost a turn. With a
 	// twenty second cooldown still running, this placement could not land.

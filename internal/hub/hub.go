@@ -36,7 +36,47 @@ type Subscriber struct {
 	C    chan Frame
 	Name string
 
-	dropped atomic.Bool
+	// mu makes sending on C and closing it mutually exclusive.
+	//
+	// broadcast deliberately copies the subscriber set and then releases the
+	// hub lock before delivering, so a slow client cannot stall everyone else.
+	// That leaves a window in which another goroutine can close this channel
+	// between the copy and the send - and a send on a closed channel is not a
+	// dropped message, it is a panic that takes the whole process with it.
+	// Every broadcast reaches this from somewhere: a request goroutine
+	// announcing presence, the coalescing loop flushing pixels, the cursor tick,
+	// and shutdown closing everything at once.
+	mu     sync.Mutex
+	closed bool
+}
+
+// send offers one frame without blocking. ok reports whether it was delivered,
+// alive whether the client is still connected at all.
+func (s *Subscriber) send(f Frame) (ok, alive bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false, false
+	}
+	select {
+	case s.C <- f:
+		return true, true
+	default:
+		return false, true
+	}
+}
+
+// close shuts the channel exactly once, reporting whether this call was the one
+// that did it, so the caller knows whether the bookkeeping is still theirs to do.
+func (s *Subscriber) close() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.closed = true
+	close(s.C)
+	return true
 }
 
 // Hub owns the subscriber set and the broadcast loop.
@@ -98,14 +138,13 @@ func (h *Hub) Subscribe(name string) *Subscriber {
 
 // Unsubscribe removes a client and closes its channel exactly once.
 func (h *Hub) Unsubscribe(s *Subscriber) {
-	if s == nil || !s.dropped.CompareAndSwap(false, true) {
+	if s == nil || !s.close() {
 		return
 	}
 	h.mu.Lock()
 	delete(h.subs, s.ID)
 	n := len(h.subs)
 	h.mu.Unlock()
-	close(s.C)
 
 	h.log.Debug("client unsubscribed", "id", s.ID, "transport", s.Name, "total", n)
 	h.announcePresence(true)
@@ -195,14 +234,16 @@ func (h *Hub) broadcast(bin, txt Frame) {
 		if s.Name == "ws" {
 			f = bin
 		}
-		select {
-		case s.C <- f:
+		switch ok, alive := s.send(f); {
+		case ok:
 			h.stats.broadcast.Add(1)
-		default:
+		case alive:
 			h.stats.dropped.Add(1)
 			h.log.Warn("client too slow, disconnecting", "id", s.ID, "transport", s.Name)
 			go h.Unsubscribe(s)
 		}
+		// A subscriber that is no longer alive was closed between the copy above
+		// and this send. Nothing to do: whoever closed it has already removed it.
 	}
 }
 
@@ -251,9 +292,7 @@ func (h *Hub) closeAll() {
 	h.mu.Unlock()
 
 	for _, s := range subs {
-		if s.dropped.CompareAndSwap(false, true) {
-			close(s.C)
-		}
+		s.close()
 	}
 }
 

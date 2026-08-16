@@ -314,16 +314,22 @@ func (r *Room) UndoOwn(ctx context.Context, uid string) (canvas.Pixel, error) {
 	// every open tab would keep showing a pixel the log says is gone.
 	r.ClearCooldown(uid)
 
-	// Apply as a fresh placement so every connected client sees it.
 	px, err := r.Canvas.Place(mine.X, mine.Y, beneath, uid, time.Now())
 	if err != nil {
 		// The cell already holds that colour, which can happen if the canvas
-		// was rebuilt underneath us. Nothing to broadcast, but the log is right.
+		// was rebuilt underneath us. The log is right either way.
 		r.Canvas.Apply(mine.X, mine.Y, beneath, r.Canvas.Seq())
 		px = canvas.Pixel{X: mine.X, Y: mine.Y, Color: beneath, UID: uid}
-	} else {
-		r.Hub.Publish(px)
 	}
+
+	// Announced as a retraction rather than published as a placement. It reaches
+	// the same clients over the same transports either way, but a client that
+	// counts it as a placement drifts one ahead of the server on every undo,
+	// and one showing that cell's history has no way to know the entry on
+	// screen has just been taken back.
+	r.Hub.BroadcastJSON(map[string]any{
+		"t": "undone", "x": px.X, "y": px.Y, "c": px.Color, "uid": uid, "s": px.Seq,
+	})
 	// Applying it re-armed the cooldown, so clear it once more: undoing a
 	// misclick must not cost the painter their turn.
 	r.ClearCooldown(uid)

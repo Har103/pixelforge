@@ -922,6 +922,19 @@ function handleJSON(raw) {
       });
       el.statPlacements.textContent = fmt(S.placements);
       break;
+    case 'undone':
+      // Deliberately not counted as a placement: the server does not record it
+      // as one either, and a client that counted it would drift one ahead of
+      // every stat page and every reload.
+      if (!S.lapse) writePixel(msg.x, msg.y, msg.c);
+      pushFeed(msg.x, msg.y, msg.c);
+      // If the panel happens to be open on that very cell, the history it is
+      // showing is now wrong. Ask again rather than leave a retracted pixel on
+      // screen looking current.
+      if (S.inspect && S.inspect.x === msg.x && S.inspect.y === msg.y) {
+        inspectCell(msg.x, msg.y);
+      }
+      break;
     case 'denied':
       S.readyAt = Date.now() + (msg.retryInMs || 0);
       toast(msg.reason || 'placement rejected', 'warn');

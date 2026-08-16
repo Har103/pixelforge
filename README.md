@@ -355,8 +355,15 @@ against roughly 1.5 MB for the equivalent JSON.
 ```
 
 **Control messages** (WebSocket text frames and every SSE event) are JSON:
-`{"t":"hello"|"presence"|"px"|"denied"|"cursors"|"locks"|"room", …}`. The client
-sends `{"t":"place"}`, `{"t":"cur"}` and `{"t":"curoff"}` back up the socket.
+`{"t":"hello"|"presence"|"px"|"denied"|"cursors"|"undone"|"locks"|"room", …}`.
+The client sends `{"t":"place"}`, `{"t":"cur"}` and `{"t":"curoff"}` back up the
+socket.
+
+A retraction gets its own message rather than riding the pixel batch. It carries
+the same information a placement would, but a client that counted it as a
+placement drifts one ahead of the server on every undo, and a client showing
+that cell's history has no way to know the entry on screen has just been taken
+back.
 
 Cursor traffic skips the rate limiter and is coalesced onto its own tick, which
 is safe precisely because it is never stored: the worst a flood can do is
@@ -413,6 +420,11 @@ Worth singling out:
   stranger, accepts the creator's cookie, and accepts the recovery link's key
   from a browser that has never seen the room
 - `TestBanAndUndo` — undoing a painter restores what they painted over, from the log
+- `TestBroadcastSurvivesClientsLeavingMidSend` — the fan-out deliberately drops
+  the hub lock before delivering so one slow client cannot stall everyone, which
+  left a window where another goroutine could close the channel about to be
+  written to. That is not a lost message, it is `panic: send on closed channel`.
+  Remove the guard and this test reproduces it in about 16&nbsp;ms
 - `TestUndoPutsBackWhatWasUnderneath` — a stranger paints, you paint over them,
   Ctrl+Z in a real browser restores *their* colour; then they paint over you and
   the same key is refused
