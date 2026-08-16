@@ -136,6 +136,15 @@ func ephemeralCases() map[string]func(*testing.T, *Store) {
 				t.Errorf("ClearRoom = %v, want nil", err)
 			}
 		},
+		"DeleteRoom": func(t *testing.T, s *Store) {
+			// Succeeds rather than reporting ErrNotFound. There is nothing to
+			// delete, but the caller has already taken the room out of memory and
+			// told everybody watching, so the only thing an error could achieve
+			// here is a red message about a canvas that really has gone.
+			if err := s.DeleteRoom(ctx, 1); err != nil {
+				t.Errorf("DeleteRoom = %v, want nil: with no database the room is already as gone as it can be", err)
+			}
+		},
 		"Locks": func(t *testing.T, s *Store) {
 			got, err := s.Locks(ctx, 1)
 			if err != nil {

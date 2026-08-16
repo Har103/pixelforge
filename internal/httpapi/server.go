@@ -98,6 +98,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/r/{slug}/mod/ban", s.withOwner(s.handleModBan))
 	mux.HandleFunc("POST /api/r/{slug}/mod/undo", s.withOwner(s.handleModUndo))
 	mux.HandleFunc("POST /api/r/{slug}/mod/locks", s.withOwner(s.handleModLocks))
+	mux.HandleFunc("POST /api/r/{slug}/mod/delete", s.withOwner(s.handleModDelete))
 
 	// Accounts
 	mux.HandleFunc("POST /api/auth/register", s.handleRegister)

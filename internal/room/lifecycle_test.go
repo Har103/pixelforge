@@ -2,6 +2,7 @@ package room
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -417,5 +418,130 @@ func TestARoomWithNoDatabaseStillPaints(t *testing.T) {
 func TestErrRoomClosedReadsAsSomethingToRetry(t *testing.T) {
 	if !strings.Contains(ErrRoomClosed.Error(), "try again") {
 		t.Errorf("ErrRoomClosed = %q, which does not tell the painter their pixel is worth resending", ErrRoomClosed)
+	}
+}
+
+// --------------------------------------------------------------- deleting ----
+
+// TestDeletingARoomRemovesEverythingItOwned is the only destructive operation in
+// the product, so it gets the most explicit test. A half-deleted room - rows
+// without a room, or a room row whose pixels have gone - is worse than no delete
+// at all: it shows up on the browse page as a canvas that cannot be opened.
+func TestDeletingARoomRemovesEverythingItOwned(t *testing.T) {
+	reg, st, pool := newRegistry(t)
+	ctx := testCtx(t)
+
+	rm, err := reg.Create(ctx, Spec{Name: "doomed", Width: 16, Height: 16, CooldownMs: 0, Unlisted: true})
+	if err != nil {
+		t.Fatalf("creating the room: %v", err)
+	}
+	roomID, slug := rm.Meta.ID, rm.Meta.Slug
+
+	// Give it something in every table that hangs off a room, so "everything"
+	// means something.
+	if _, err := rm.Place(1, 1, 3, "alec"); err != nil {
+		t.Fatalf("painting: %v", err)
+	}
+	waitForSeq(t, pool, roomID, 1)
+	if err := rm.SetLocks(ctx, []Lock{{X1: 2, Y1: 2, X2: 4, Y2: 4}}); err != nil {
+		t.Fatalf("locking: %v", err)
+	}
+	if err := st.Ban(ctx, roomID, "bess"); err != nil {
+		t.Fatalf("banning: %v", err)
+	}
+	if err := rm.snapshot(ctx); err != nil {
+		t.Fatalf("snapshotting: %v", err)
+	}
+
+	counts := func(when string) map[string]int64 {
+		t.Helper()
+		out := map[string]int64{}
+		for table, sql := range map[string]string{
+			"rooms":           `select count(*) from rooms where id = $1`,
+			"room_placements": `select count(*) from room_placements where room_id = $1`,
+			"room_snapshots":  `select count(*) from room_snapshots where room_id = $1`,
+			"bans":            `select count(*) from bans where room_id = $1`,
+			"locks":           `select count(*) from locks where room_id = $1`,
+		} {
+			res, err := pool.Query(ctx, sql, roomID)
+			if err != nil {
+				t.Fatalf("counting %s %s: %v", table, when, err)
+			}
+			n, _ := pg.Int64(res.Rows[0][0])
+			out[table] = n
+		}
+		return out
+	}
+
+	before := counts("before the delete")
+	for table, n := range before {
+		if n == 0 {
+			t.Fatalf("%s is already empty before the delete, so this test would pass without deleting anything", table)
+		}
+	}
+
+	if err := reg.Delete(ctx, rm); err != nil {
+		t.Fatalf("deleting the room: %v", err)
+	}
+
+	for table, n := range counts("after the delete") {
+		if n != 0 {
+			t.Errorf("%d row(s) left in %s after deleting the room", n, table)
+		}
+	}
+	if !rm.Closed() {
+		t.Error("the deleted room is still running, so its write-behind loop could put history back into a table that no longer has a room")
+	}
+	if _, resident := reg.Lookup(slug); resident {
+		t.Error("the deleted room is still in the registry, so the slug still resolves to it")
+	}
+	if _, err := reg.Get(ctx, slug); !errors.Is(err, ErrNotFound) {
+		t.Errorf("loading the deleted slug returned %v, want ErrNotFound", err)
+	}
+}
+
+// TestDeletingARoomTellsThePeopleWatching. A canvas disappearing with no
+// explanation is worse than one that says goodbye, and a client that is not told
+// spends the next ten seconds reconnecting to something that will never answer.
+func TestDeletingARoomTellsThePeopleWatching(t *testing.T) {
+	reg, _, pool := newRegistry(t)
+	ctx := testCtx(t)
+
+	rm := makeRoom(t, reg, pool, "farewell")
+	sub := rm.Hub.Subscribe("sse")
+
+	frames := make(chan string, 32)
+	go func() {
+		for f := range sub.C {
+			frames <- string(f.Data)
+		}
+		close(frames)
+	}()
+
+	if err := reg.Delete(ctx, rm); err != nil {
+		t.Fatalf("deleting the room: %v", err)
+	}
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case raw, ok := <-frames:
+			if !ok {
+				t.Fatal("the subscription closed without ever saying the canvas had been deleted")
+			}
+			var msg struct {
+				T      string `json:"t"`
+				Reason string `json:"reason"`
+			}
+			if err := json.Unmarshal([]byte(raw), &msg); err != nil || msg.T != "deleted" {
+				continue
+			}
+			if msg.Reason == "" {
+				t.Error("the deletion frame carries no reason, so the page can only say something vague")
+			}
+			return
+		case <-deadline:
+			t.Fatal("no deletion frame arrived within five seconds")
+		}
 	}
 }

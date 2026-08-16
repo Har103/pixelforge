@@ -421,6 +421,44 @@ func (r *Registry) shutdown() {
 	r.log.Info("all rooms released", "count", len(rooms))
 }
 
+// Delete removes a room from memory and from the database, telling anybody still
+// connected before it goes.
+//
+// The order matters. The room comes out of the registry first, so that no new
+// request can resolve the slug to an object that is about to stop existing. Then
+// the people watching are told, because a canvas vanishing with no explanation
+// is worse than one that says goodbye. Then the room is stopped - which is what
+// makes its write-behind loop return, and is why the rows are only removed after
+// that: a loop still running would cheerfully write a placement back into a
+// table we had just emptied, leaving orphaned history and a room row that no
+// longer exists.
+func (r *Registry) Delete(ctx context.Context, rm *Room) error {
+	r.mu.Lock()
+	if cur, ok := r.rooms[rm.Meta.Slug]; ok && cur == rm {
+		delete(r.rooms, rm.Meta.Slug)
+	}
+	r.mu.Unlock()
+
+	rm.Hub.BroadcastJSON(map[string]any{
+		"t": "deleted", "reason": "the owner deleted this canvas",
+	})
+	// Long enough for the coalescing loop to put that on the wire. Without it the
+	// hub is closed before the frame is flushed and everybody simply drops.
+	time.Sleep(150 * time.Millisecond)
+
+	rm.stop()
+
+	if err := r.store.DeleteRoom(ctx, rm.Meta.ID); err != nil {
+		// The room is already out of memory and its watchers already know, so
+		// there is no going back from here - but a row left behind would show up
+		// on the browse page as a canvas that cannot be opened, which is worse
+		// than a clear error.
+		return err
+	}
+	r.log.Info("room deleted", "room", rm.Meta.Slug)
+	return nil
+}
+
 // Resident reports how many rooms are in memory and how many clients they hold.
 func (r *Registry) Resident() (rooms, clients int) {
 	r.mu.Lock()

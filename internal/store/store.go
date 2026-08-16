@@ -595,6 +595,38 @@ func (s *Store) ClearRoom(ctx context.Context, roomID int64) error {
 	return err
 }
 
+// DeleteRoom removes a room and everything belonging to it.
+//
+// This is the only destructive operation in the store, and it exists because
+// there was no way to take a canvas back. Somebody who created one by mistake,
+// or tested with a name they regret, or simply finished with it, had made a
+// permanent entry on a public browse page. Clear only blanks the grid and leaves
+// the room; pausing hides nothing.
+//
+// One statement, so a half-deleted room cannot exist even briefly - the children
+// go in data-modifying CTEs and the room itself in the outer delete, which
+// PostgreSQL runs as a single transaction. The order does not matter for
+// correctness here because there are no foreign keys, but it does matter that
+// nothing can observe a room whose pixels have already gone.
+func (s *Store) DeleteRoom(ctx context.Context, roomID int64) error {
+	if s.Ephemeral() {
+		return nil
+	}
+	res, err := s.pool.Query(ctx, `
+		with p as (delete from room_placements where room_id = $1),
+		     s as (delete from room_snapshots  where room_id = $1),
+		     b as (delete from bans            where room_id = $1),
+		     l as (delete from locks           where room_id = $1)
+		delete from rooms where id = $1 returning id`, roomID)
+	if err != nil {
+		return fmt.Errorf("store: deleting room: %w", err)
+	}
+	if len(res.Rows) == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // ------------------------------------------------------------------ bans ----
 
 // Bans returns the banned painter ids for a room.

@@ -430,6 +430,50 @@ func (s *Server) handleModLocks(w http.ResponseWriter, r *http.Request, rm *room
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "locks": rm.Locks()})
 }
 
+// handleModDelete removes a canvas for good.
+//
+// The confirmation is the room's own slug, typed back. Not a boolean, because a
+// boolean is one mis-click away from irreversible, and not a modal alone,
+// because the API is reachable without the UI. Typing the name is the cheapest
+// way to make somebody prove they meant this particular canvas.
+func (s *Server) handleModDelete(w http.ResponseWriter, r *http.Request, rm *room.Room) {
+	var req struct {
+		Confirm string `json:"confirm"`
+	}
+	if err := readJSON(w, r, s.MaxBodyBytes, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "malformed request body"})
+		return
+	}
+	if strings.TrimSpace(req.Confirm) != rm.Slug() {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "type the canvas name exactly to confirm: " + rm.Slug(),
+		})
+		return
+	}
+
+	// Not the request's context. A visitor who closes the tab mid-delete would
+	// cancel it partway through, and half a deletion is the one outcome worth
+	// avoiding here.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
+	defer cancel()
+
+	slug := rm.Slug()
+	if err := s.Rooms.Delete(ctx, rm); err != nil {
+		s.Log.Error("deleting room", "room", slug, "err", err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "the canvas was closed but its records could not be removed; try again",
+		})
+		return
+	}
+	// Clear the moderator cookie: it names a room that no longer exists, and
+	// leaving it behind means the browser carries a key to nothing for a year.
+	http.SetCookie(w, &http.Cookie{
+		Name: modCookie(slug), Value: "", Path: "/", HttpOnly: true,
+		SameSite: http.SameSiteLaxMode, Secure: isHTTPS(r), MaxAge: -1,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deleted": slug})
+}
+
 func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request, rm *room.Room) {
 	uid := s.accountID(r)
 	if uid == 0 {

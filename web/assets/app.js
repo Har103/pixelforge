@@ -1286,6 +1286,9 @@ function setConn(state, label) {
 
 function connect() {
   disconnect();
+  // 'gone' means the canvas was deleted underneath us. Reconnecting would spend
+  // the next ten seconds retrying something that will never answer again.
+  if (S.transport === 'gone') return;
   if (S.transport === 'ws') connectWS(); else connectSSE();
 }
 
@@ -1444,6 +1447,19 @@ function handleJSON(raw) {
     case 'locks':
       S.locks = msg.locks || [];
       S.dirty = true;
+      break;
+    case 'deleted':
+      // The canvas this page is showing no longer exists. Stop reconnecting -
+      // otherwise the client spends the next ten seconds retrying a 404 - say
+      // what happened, and let them leave.
+      S.transport = 'gone';
+      disconnect();
+      setConn('down', 'gone');
+      saySelf(msg.reason || 'This canvas was deleted.');
+      openSheet(`<h2>This canvas is gone</h2>
+        <p>${escapeAttr(msg.reason || 'The owner deleted it.')} Nothing you paint
+        here now will be saved.</p>
+        <div class="sheet-actions"><a class="primary linkish" href="/">See the other canvases</a></div>`);
       break;
     case 'cleared':
       toast('the owner cleared the canvas', 'warn');
@@ -1833,6 +1849,19 @@ async function manageSheet() {
     <p>Wipes the grid to background. The history is kept, so a time-lapse still
     shows what was there.</p>
     <div class="sheet-actions"><button class="danger" id="mClear">Clear the canvas</button></div>
+
+    <h3 class="danger-head">Delete this canvas</h3>
+    <p>Removes the canvas, every pixel, its whole history and this link, for good.
+    Anybody looking at it right now will be told it is gone. There is no undo and
+    no time-lapse afterwards.</p>
+    <label class="field">
+      <span class="field-label" id="mDelLabel">Type <code>${escapeAttr(SLUG)}</code> to confirm</span>
+      <input type="text" id="mDelConfirm" autocomplete="off" spellcheck="false"
+             aria-labelledby="mDelLabel" aria-describedby="mDelHint" placeholder="${escapeAttr(SLUG)}">
+    </label>
+    <p class="hint" id="mDelHint">Typing the name is deliberate. A button on its own
+    is one mis-click away from something that cannot be taken back.</p>
+    <div class="sheet-actions"><button class="danger" id="mDelete" disabled>Delete for ever</button></div>
   `);
 
   $('mPause').addEventListener('click', async () => {
@@ -1881,6 +1910,28 @@ async function manageSheet() {
       toast('canvas cleared');
       closeSheet();
     } catch (e) { toast(e.message, 'bad'); }
+  });
+
+  // The button only becomes usable once the name matches, so the confirmation is
+  // a state you have to reach rather than a dialog you dismiss.
+  const delInput = $('mDelConfirm');
+  const delButton = $('mDelete');
+  delInput.addEventListener('input', () => {
+    delButton.disabled = delInput.value.trim() !== SLUG;
+  });
+  delButton.addEventListener('click', async () => {
+    if (delInput.value.trim() !== SLUG) return;
+    delButton.disabled = true;
+    delButton.textContent = 'Deleting…';
+    try {
+      await mod('delete', { confirm: delInput.value.trim() });
+      // Leave rather than sit on a page whose canvas no longer exists.
+      location.href = '/?deleted=' + encodeURIComponent(SLUG);
+    } catch (e) {
+      delButton.disabled = false;
+      delButton.textContent = 'Delete for ever';
+      toast(e.message, 'bad');
+    }
   });
 
   el.sheetBody.querySelectorAll('[data-ban]').forEach((b) => b.addEventListener('click', async () => {
