@@ -188,6 +188,14 @@ func (c *Canvas) pruneLocked(now time.Time) {
 	c.lastPrune = now
 }
 
+// ClearCooldown lets a painter act again immediately. It exists so undoing a
+// misclick does not also cost the painter their turn.
+func (c *Canvas) ClearCooldown(uid string) {
+	c.mu.Lock()
+	delete(c.lastPlace, uid)
+	c.mu.Unlock()
+}
+
 // Clear resets every pixel to the background and bumps the sequence.
 func (c *Canvas) Clear() int64 {
 	c.mu.Lock()

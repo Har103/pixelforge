@@ -75,10 +75,13 @@ jobs:
         with:
           go-version: '1.26'
 
-      - name: API integration tests against a real database
+      - name: Integration tests against a real database
         env:
           PIXELFORGE_TEST_DSN: postgres://pixelforge:pixelforge@127.0.0.1:5432/pixelforge?sslmode=disable
-        run: go test -race -count=1 ./internal/httpapi/
+        # Every package that skips without a DSN belongs here, or the skip is
+        # permanent and the tests are decoration: the store's queries and the
+        # room's undo both read the placement log and both need a real one.
+        run: go test -race -count=1 ./internal/httpapi/ ./internal/store/ ./internal/room/
 
       - name: run the server and exercise it
         env:
@@ -122,6 +125,55 @@ jobs:
           echo "restored sequence: $seq"
           test "$seq" -ge 1
           kill -TERM $PID; wait $PID || true
+
+  browser:
+    name: end-to-end in a real browser
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pixelforge
+          POSTGRES_PASSWORD: pixelforge
+          POSTGRES_DB: pixelforge
+          POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+          POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U pixelforge"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      # The suite drives Chrome over the DevTools Protocol using this project's
+      # own WebSocket code, so there is nothing to install here beyond the
+      # browser the runner already ships. It skips rather than fails when it
+      # cannot find one, which is why the path is pinned explicitly: a silent
+      # skip in CI is the same as having no browser tests at all.
+      - name: Locate the runner's Chrome
+        run: |
+          set -euo pipefail
+          for candidate in \
+              "$(command -v google-chrome-stable || true)" \
+              "$(command -v google-chrome || true)" \
+              "$(command -v chromium-browser || true)" \
+              "$(command -v chromium || true)"; do
+            if [ -n "$candidate" ]; then
+              echo "PIXELFORGE_E2E_CHROME=$candidate" >> "$GITHUB_ENV"
+              "$candidate" --version
+              exit 0
+            fi
+          done
+          echo "no Chrome on this runner, so the browser suite would silently skip" >&2
+          exit 1
+
+      - name: End-to-end tests
+        env:
+          PIXELFORGE_TEST_DSN: postgres://pixelforge:pixelforge@127.0.0.1:5432/pixelforge?sslmode=disable
+        run: go test -race -count=1 -timeout 10m ./internal/e2e/
 
   image:
     name: container image

@@ -46,6 +46,10 @@ create table if not exists room_placements (
 create index if not exists room_placements_seq_idx on room_placements (room_id, room_seq);
 create index if not exists room_placements_uid_idx on room_placements (room_id, uid);
 
+-- "Who painted this cell, and what was here before?" is a per-cell question, and
+-- without this index it is a sequential scan of the room's whole history.
+create index if not exists room_placements_cell_idx on room_placements (room_id, x, y, room_seq desc);
+
 create table if not exists room_snapshots (
     room_id    bigint      primary key,
     width      integer     not null,

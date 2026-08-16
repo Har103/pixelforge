@@ -42,15 +42,36 @@ func New(pool *pg.Pool, log *slog.Logger) *Store {
 // Ephemeral reports whether there is no database behind this store.
 func (s *Store) Ephemeral() bool { return s == nil || s.pool == nil }
 
+// migrationLock is an arbitrary but fixed advisory lock key, taken for the
+// length of each migration statement.
+//
+// "create table if not exists" is not atomic against a concurrent creator: it
+// looks, finds nothing, and then loses the race inserting into the catalogue,
+// which surfaces as "duplicate key value violates unique constraint
+// pg_type_typname_nsp_index" and fails the whole migration. Two processes
+// starting against one empty database at the same moment is not hypothetical -
+// it is what a rolling deploy does, and what a test suite running several
+// packages against one database does. Ten concurrent migrations against an
+// empty schema fail five times without this lock and never with it.
+const migrationLock = 4467831641293411
+
 // Migrate applies the schema and folds a pre-rooms installation forward.
 func (s *Store) Migrate(ctx context.Context) error {
 	if s.Ephemeral() {
 		return nil
 	}
-	if err := s.pool.Exec(ctx, schema); err != nil {
+	// Each Exec is a single simple-protocol query, which PostgreSQL runs as one
+	// implicit transaction, so a transaction-scoped lock covers the whole batch
+	// and is released without anything having to remember to unlock it - which
+	// matters, because the alternative leaks the lock when a migration fails.
+	lock := fmt.Sprintf("select pg_advisory_xact_lock(%d);\n", migrationLock)
+
+	if err := s.pool.Exec(ctx, lock+schema); err != nil {
 		return fmt.Errorf("store: applying schema: %w", err)
 	}
-	if err := s.pool.Exec(ctx, migrateV1); err != nil {
+	// The v1 fold has to serialise for a different reason: its guard is "the old
+	// tables exist and rooms is empty", which two callers can both see at once.
+	if err := s.pool.Exec(ctx, lock+migrateV1); err != nil {
 		return fmt.Errorf("store: migrating the pre-rooms canvas: %w", err)
 	}
 	return nil
@@ -628,4 +649,129 @@ func (s *Store) Ready(ctx context.Context) error {
 		return nil
 	}
 	return s.pool.Do(ctx, func(c *pg.Conn) error { return c.Ping(ctx) })
+}
+
+// -------------------------------------------------------------- one cell ----
+
+// CellPlacement is one entry in a single cell's history.
+type CellPlacement struct {
+	Seq    int64     `json:"seq"`
+	Color  uint8     `json:"c"`
+	UID    string    `json:"uid"`
+	At     time.Time `json:"-"`
+	AtMs   int64     `json:"t"`
+	Undone bool      `json:"undone"`
+}
+
+// CellHistory returns the most recent placements at one cell, newest first.
+// This is what powers "who painted this, and what was underneath" — the
+// question that turns a grid into something people argue about.
+func (s *Store) CellHistory(ctx context.Context, roomID int64, x, y, limit int) ([]CellPlacement, error) {
+	if s.Ephemeral() {
+		return nil, nil
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 12
+	}
+	res, err := s.pool.Query(ctx, `
+		select room_seq, color, uid, extract(epoch from created_at) * 1000, undone
+		  from room_placements
+		 where room_id = $1 and x = $2 and y = $3
+		 order by room_seq desc
+		 limit $4`, roomID, x, y, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: reading cell history: %w", err)
+	}
+	out := make([]CellPlacement, 0, len(res.Rows))
+	for _, r := range res.Rows {
+		seq, _ := pg.Int64(r[0])
+		c, _ := pg.Int(r[1])
+		ms, _ := pg.Float64(r[3])
+		out = append(out, CellPlacement{
+			Seq: seq, Color: uint8(c), UID: pg.Text(r[2]),
+			AtMs: int64(ms), Undone: pg.Bool(r[4]),
+		})
+	}
+	return out, nil
+}
+
+// LatestOwnPlacement returns a painter's most recent live placement in a room,
+// or ErrNotFound.
+func (s *Store) LatestOwnPlacement(ctx context.Context, roomID int64, uid string) (Placement, error) {
+	if s.Ephemeral() {
+		return Placement{}, ErrNotFound
+	}
+	row, err := s.pool.QueryRow(ctx, `
+		select room_seq, x, y, color
+		  from room_placements
+		 where room_id = $1 and uid = $2 and not undone
+		 order by room_seq desc
+		 limit 1`, roomID, uid)
+	if err != nil {
+		return Placement{}, fmt.Errorf("store: finding your last placement: %w", err)
+	}
+	if row == nil {
+		return Placement{}, ErrNotFound
+	}
+	seq, _ := pg.Int64(row[0])
+	x, _ := pg.Int(row[1])
+	y, _ := pg.Int(row[2])
+	c, _ := pg.Int(row[3])
+	return Placement{Seq: seq, X: x, Y: y, Color: uint8(c), UID: uid}, nil
+}
+
+// TopPlacementAt returns the placement currently showing at a cell, or
+// ErrNotFound if the cell has never been painted.
+func (s *Store) TopPlacementAt(ctx context.Context, roomID int64, x, y int) (Placement, error) {
+	if s.Ephemeral() {
+		return Placement{}, ErrNotFound
+	}
+	row, err := s.pool.QueryRow(ctx, `
+		select room_seq, color, uid
+		  from room_placements
+		 where room_id = $1 and x = $2 and y = $3 and not undone
+		 order by room_seq desc
+		 limit 1`, roomID, x, y)
+	if err != nil {
+		return Placement{}, fmt.Errorf("store: reading cell: %w", err)
+	}
+	if row == nil {
+		return Placement{}, ErrNotFound
+	}
+	seq, _ := pg.Int64(row[0])
+	c, _ := pg.Int(row[1])
+	return Placement{Seq: seq, X: x, Y: y, Color: uint8(c), UID: pg.Text(row[2])}, nil
+}
+
+// ColourBeneath returns the colour a cell would revert to if the placement at
+// seq were undone: the newest surviving placement older than it, or the
+// background when there is none.
+func (s *Store) ColourBeneath(ctx context.Context, roomID int64, x, y int, seq int64) (uint8, error) {
+	if s.Ephemeral() {
+		return 0, nil
+	}
+	row, err := s.pool.QueryRow(ctx, `
+		select color
+		  from room_placements
+		 where room_id = $1 and x = $2 and y = $3 and not undone and room_seq < $4
+		 order by room_seq desc
+		 limit 1`, roomID, x, y, seq)
+	if err != nil {
+		return 0, fmt.Errorf("store: reading what is underneath: %w", err)
+	}
+	if row == nil {
+		return 0, nil // nothing underneath, so the background
+	}
+	c, _ := pg.Int(row[0])
+	return uint8(c), nil
+}
+
+// MarkUndone retires a single placement.
+func (s *Store) MarkUndone(ctx context.Context, roomID int64, seq int64) error {
+	if s.Ephemeral() {
+		return nil
+	}
+	_, err := s.pool.Query(ctx,
+		`update room_placements set undone = true where room_id = $1 and room_seq = $2`, roomID, seq)
+	return err
 }

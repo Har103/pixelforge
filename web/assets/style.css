@@ -177,9 +177,14 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
   min-width: 40px; text-align: center; font-variant-numeric: tabular-nums;
 }
 
-.feed {
+.hud-right {
   position: absolute; right: 14px; top: 14px; z-index: 10;
-  width: 190px; max-height: 42vh;
+  display: flex; flex-direction: column; align-items: stretch; gap: 10px;
+  width: 190px; max-height: calc(100% - 28px);
+}
+
+.feed {
+  max-height: 42vh;
   background: color-mix(in srgb, var(--bg-panel) 82%, transparent);
   border: 1px solid var(--line); border-radius: var(--radius);
   backdrop-filter: blur(10px);
@@ -198,6 +203,9 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
   animation: slideIn .22s ease;
 }
 .feed li b { color: var(--text); font-weight: 500; }
+/* An empty box under a "live" heading looks broken rather than quiet, so say
+   what it is waiting for. It goes away the moment anybody paints. */
+.feed-empty { margin: 0; padding: 5px 11px 13px; font-size: 11px; color: var(--text-faint); }
 .feed li .sw { width: 10px; height: 10px; border-radius: 2px; flex: none; box-shadow: 0 0 0 1px rgba(255,255,255,.12); }
 @keyframes slideIn { from { opacity: 0; transform: translateX(8px) } }
 
@@ -260,6 +268,96 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
 
 .dock-actions { display: flex; gap: 8px; flex: none; }
 
+/* ---------------------------------------------------------------- panels -- */
+
+/* Template and inspector share a shell. They are the two things that turn the
+   canvas from a grid into somewhere you can work: one is what you are trying to
+   paint, the other is what everyone else already painted. */
+.panel {
+  z-index: 14;
+  width: 234px; max-height: calc(100% - 28px);
+  background: color-mix(in srgb, var(--bg-panel) 92%, transparent);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  backdrop-filter: blur(12px);
+  box-shadow: 0 20px 60px -24px rgba(0,0,0,.9);
+  display: flex; flex-direction: column;
+  animation: slideIn .18s ease;
+}
+.panel-tpl { position: absolute; left: 14px; top: 14px; }
+/* The inspector is laid out by .hud-right, not pinned to the stage, so it sits
+   under the feed however tall the feed happens to be. */
+.panel-inspect { position: static; width: auto; }
+.panel-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 8px 8px 12px; border-bottom: 1px solid var(--line-soft);
+  font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-faint);
+}
+.panel-body { padding: 11px 12px 13px; overflow-y: auto; font-size: 12px; }
+.panel-err {
+  margin: 10px 0 0; font-size: 11.5px; line-height: 1.5;
+  color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--bad) 35%, transparent);
+  border-radius: 6px; padding: 7px 9px;
+}
+.panel .muted { color: var(--text-faint); font-size: 11.5px; line-height: 1.55; margin: 9px 0 0; }
+
+.dropzone {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 4px; text-align: center; cursor: pointer;
+  padding: 20px 12px; border-radius: 8px;
+  border: 1.5px dashed var(--line);
+  transition: border-color .15s, background .15s;
+}
+.dropzone:hover, .dropzone:focus-visible, .dropzone.over {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  outline: none;
+}
+.dropzone-title { font-size: 12.5px; color: var(--text); }
+.dropzone-sub { font-size: 10.5px; color: var(--text-faint); line-height: 1.45; }
+
+.panel .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.panel .row-label { font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .6px; }
+.panel .row.btns { gap: 6px; }
+.panel .row.btns > * { flex: 1; }
+.panel .row.check { justify-content: flex-start; cursor: pointer; color: var(--text-dim); font-size: 11.5px; line-height: 1.4; }
+.panel .row.check input { accent-color: var(--accent); flex: none; }
+.sel-input {
+  background: var(--bg-raised); border: 1px solid var(--line); border-radius: 6px;
+  padding: 5px 7px; font-size: 11.5px; max-width: 132px;
+}
+.tpl-progress { margin: 12px 0 11px; }
+.tpl-progress-top { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-dim); }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.tpl-count { margin: 6px 0 0; font-size: 10.5px; color: var(--text-faint); font-family: var(--mono); }
+
+.history { list-style: none; margin: 0; padding: 0; }
+.history li {
+  display: flex; align-items: center; gap: 7px;
+  padding: 5px 2px; font-family: var(--mono); font-size: 11px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.history li:last-child { border-bottom: 0; }
+.history li .sw { width: 11px; height: 11px; border-radius: 2px; flex: none; box-shadow: 0 0 0 1px rgba(255,255,255,.14); }
+.history li b { font-weight: 500; }
+.history li b.mine { color: var(--accent); }
+.history li .when { margin-left: auto; color: var(--text-faint); font-size: 10px; }
+/* A struck-through row is one somebody took back. It stays in the list because
+   "this was here and then it wasn't" is part of the answer. */
+.history li.undone { opacity: .5; }
+.history li.undone b { text-decoration: line-through; }
+
+.minimap {
+  position: absolute; right: 14px; bottom: 14px; z-index: 11;
+  width: 128px; height: 128px; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 8px;
+  background: var(--bg-panel);
+  image-rendering: pixelated;
+  box-shadow: 0 14px 40px -18px rgba(0,0,0,.9);
+  opacity: .82; transition: opacity .15s;
+}
+.minimap:hover { opacity: 1; }
+
 /* ----------------------------------------------------------------- sheet -- */
 
 .sheet {
@@ -316,12 +414,20 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
   .topbar-stats { gap: 14px; }
   .brand { flex: 0 1 auto; min-width: 0; overflow: hidden; }
   .brand h1 { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .feed { width: 150px; max-height: 30vh; }
+  .hud-right { width: 150px; }
+  .feed { max-height: 30vh; }
 }
 
 @media (max-width: 760px) {
   :root { --dock-h: 138px; }
   .feed { display: none; }
+  /* With the feed gone the right-hand column holds only the inspector, which
+     can then use the width the feed was reserving. */
+  .hud-right { width: min(234px, calc(100vw - 28px)); }
+  .panel { width: min(234px, calc(100vw - 28px)); max-height: calc(100% - 84px); }
+  /* The minimap would sit under the taller dock and behind the time-lapse bar,
+     and on a phone the canvas is rarely bigger than the screen anyway. */
+  .minimap { display: none; }
   .conn-label { display: none; }
   .conn { padding: 6px 8px; }
   .topbar-stats { gap: 12px; }
@@ -335,6 +441,11 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
 /* Below this the wordmark, three labelled stats and the transport controls
    genuinely cannot share a row. Drop to the mark, two bare numbers, and icons. */
 @media (max-width: 560px) {
+  /* Three rows: the palette, then the cooldown dial and the four actions. They
+     will not fit on two at this width, and a dock that wraps past its own
+     height does not overflow sideways - it just hides the controls off the
+     bottom of the screen, where nothing catches it. Give it the room. */
+  :root { --dock-h: 168px; }
   .topbar { gap: 8px; padding: 0 10px; }
   .brand { flex: none; }
   .brand h1 { display: none; }
@@ -344,6 +455,21 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
   .stat-value { font-size: 14px; }
   .topbar-right { flex: none; gap: 6px; }
   button.ghost { padding: 6px 9px; }
+
+  /* The room's dimensions and cooldown wrapped onto a second line here, which
+     pushed the header taller than --top-h and let it overlap the canvas. The
+     canvas itself and the room's own page already say all of this. */
+  .room-sub { display: none; }
+
+  /* Four action buttons plus the cooldown dial no longer share a row at this
+     width, and a wrapped row is a row taller than --dock-h - which does not
+     overflow sideways, so nothing catches it, it just quietly hides the
+     controls off the bottom of the screen. Shrink the labels instead. */
+  .dock-actions { gap: 6px; }
+  .dock-actions button.ghost { font-size: 11.5px; padding: 6px 8px; }
+  .cooldown { gap: 6px; }
+  .cooldown svg { width: 28px; height: 28px; }
+  #cooldownText { font-size: 11px; min-width: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -512,7 +638,12 @@ button.danger:hover { background: color-mix(in srgb, var(--bad) 26%, transparent
 
 .room-title { min-width: 0; margin-right: auto; }
 .room-title h1 { font-size: 14.5px; margin: 0; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.room-sub { margin: 1px 0 0; font-size: 11px; color: var(--text-faint); font-family: var(--mono); }
+.room-sub {
+  margin: 1px 0 0; font-size: 11px; color: var(--text-faint); font-family: var(--mono);
+  /* One line, always. Wrapping makes the header taller than --top-h and the
+     header then covers the top of the canvas. */
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 body.is-paused .stage { cursor: not-allowed; }
 body.is-paused #board { filter: saturate(.55) brightness(.85); }
 

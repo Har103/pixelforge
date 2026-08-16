@@ -213,6 +213,7 @@ func (r *Registry) materialise(ctx context.Context, meta store.Room) (*Room, err
 		hubDone: make(chan struct{}),
 		stopped: make(chan struct{}),
 		bans:    map[string]bool{},
+		cursors: map[string]Cursor{},
 		paused:  meta.Paused,
 	}
 	rm.Touch()

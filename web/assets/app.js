@@ -45,6 +45,16 @@ const S = {
   owner: false,
   paused: false,
   locks: [],
+  cursors: [],          // other people's pointers, ephemeral
+  cursorSent: 0,
+  cursorCell: null,     // the last cell we told the server about
+  uid: '',              // our own painter id, so we can drop our own cursor
+  template: null,       // the ghost image being traced over
+  templateOn: true,
+  templateSrc: null,    // the decoded image, kept so re-dithering needs no reload
+  tplMove: false,       // dragging the template into position
+  inspect: null,        // the cell whose provenance is on screen
+  minimap: true,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -60,6 +70,14 @@ const el = {
   btnPlay: $('btnPlay'), pausedBadge: $('pausedBadge'),
   roomName: $('roomName'), roomSub: $('roomSub'),
   btnOwner: $('btnOwner'), btnShare: $('btnShare'), btnGif: $('btnGif'),
+  minimap: $('minimap'), feedEmpty: $('feedEmpty'),
+  tplPanel: $('tplPanel'), tplDrop: $('tplDrop'), tplFile: $('tplFile'),
+  tplLoaded: $('tplLoaded'), tplMode: $('tplMode'), tplAvoidBg: $('tplAvoidBg'),
+  tplSize: $('tplSize'), tplPercent: $('tplPercent'), tplBar: $('tplBar'),
+  tplCount: $('tplCount'), tplErr: $('tplErr'),
+  btnTplMove: $('btnTplMove'), btnTplToggle: $('btnTplToggle'),
+  inspectPanel: $('inspectPanel'), inspectTitle: $('inspectTitle'), inspectBody: $('inspectBody'),
+  btnUndo: $('btnUndo'),
 };
 
 const ctx = el.board.getContext('2d', { alpha: false });
@@ -90,6 +108,16 @@ function toast(msg, kind) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { el.toast.className = 'toast'; }, 2200);
 }
+
+// Painter colours are derived from the id rather than assigned, so the same
+// person is the same colour for everyone watching, with no coordination.
+const CURSOR_HUES = [12, 32, 52, 92, 152, 172, 192, 212, 258, 288, 318, 338];
+function hueFor(uid) {
+  let h = 0;
+  for (let i = 0; i < uid.length; i++) h = (h * 31 + uid.charCodeAt(i)) >>> 0;
+  return CURSOR_HUES[h % CURSOR_HUES.length];
+}
+const cursorColour = (uid) => `hsl(${hueFor(uid)} 85% 62%)`;
 
 // -------------------------------------------------------------- rendering --
 
@@ -177,6 +205,37 @@ function render() {
     ctx.stroke();
   }
 
+  // The template ghost sits under everything else: it is a guide, so it must
+  // never be mistaken for a pixel somebody actually painted.
+  if (S.template && S.templateOn) {
+    const t = S.template;
+    if (!t._canvas) {
+      t._canvas = document.createElement('canvas');
+      t._canvas.width = t.width; t._canvas.height = t.height;
+      t._ctx = t._canvas.getContext('2d');
+    }
+    if (t._dirty !== false) {
+      const rgba = t.rgba(S.rgb);
+      const img = t._ctx.createImageData(t.width, t.height);
+      img.data.set(rgba);
+      t._ctx.putImageData(img, 0, 0);
+      t._dirty = false;
+    }
+    ctx.save();
+    ctx.globalAlpha = 0.45;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(t._canvas, 0, 0, t.width, t.height,
+      ox + t.x * scale, oy + t.y * scale, t.width * scale, t.height * scale);
+    ctx.restore();
+    ctx.save();
+    ctx.strokeStyle = 'rgba(58,134,255,.75)';
+    ctx.setLineDash([4, 3]);
+    ctx.lineWidth = 1;
+    ctx.strokeRect(ox + t.x * scale - .5, oy + t.y * scale - .5,
+      t.width * scale + 1, t.height * scale + 1);
+    ctx.restore();
+  }
+
   // Locked regions, hatched so they read as off-limits rather than decorative
   if (S.locks.length) {
     ctx.save();
@@ -220,6 +279,79 @@ function render() {
   ctx.strokeStyle = 'rgba(255,255,255,.10)';
   ctx.lineWidth = 1;
   ctx.strokeRect(ox - 0.5, oy - 0.5, w + 1, h + 1);
+
+  // Other people's pointers. Drawn last so they are never hidden by the art,
+  // and drawn as a filled cell plus a caret so the target is unambiguous even
+  // when two people hover the same spot.
+  if (S.cursors.length) {
+    ctx.save();
+    S.cursors.forEach((c) => {
+      const cx = ox + c.x * scale, cy = oy + c.y * scale;
+      if (cx < -scale || cy < -scale || cx > r.width || cy > r.height) return;
+      const col = cursorColour(c.u);
+      ctx.fillStyle = S.palette[c.k] || '#fff';
+      ctx.globalAlpha = 0.55;
+      ctx.fillRect(cx, cy, scale, scale);
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = col;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(cx - 1, cy - 1, scale + 2, scale + 2);
+      // a small caret pointing at the cell, so a 1px cell is still findable
+      ctx.beginPath();
+      ctx.moveTo(cx + scale + 2, cy + scale + 2);
+      ctx.lineTo(cx + scale + 11, cy + scale + 7);
+      ctx.lineTo(cx + scale + 7, cy + scale + 11);
+      ctx.closePath();
+      ctx.fillStyle = col;
+      ctx.fill();
+    });
+    ctx.restore();
+  }
+
+  // The cell whose provenance is open, marked so the panel and the grid agree.
+  if (S.inspect) {
+    const ix = ox + S.inspect.x * scale, iy = oy + S.inspect.y * scale;
+    ctx.save();
+    ctx.strokeStyle = '#ffd60a';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 3]);
+    ctx.strokeRect(ix - 1.5, iy - 1.5, scale + 3, scale + 3);
+    ctx.restore();
+  }
+
+  drawMinimap(r);
+}
+
+// A minimap only earns its space once the canvas is bigger than the viewport.
+// Below that it is a second, worse copy of what you are already looking at.
+function drawMinimap(r) {
+  const el = document.getElementById('minimap');
+  if (!el) return;
+  const worth = S.minimap && (S.W * S.view.scale > r.width || S.H * S.view.scale > r.height);
+  el.hidden = !worth;
+  if (!worth) return;
+
+  const m = el.getContext('2d');
+  const size = 128;
+  if (el.width !== size) { el.width = size; el.height = size; }
+  const s = Math.min(size / S.W, size / S.H);
+  const w = S.W * s, h = S.H * s;
+  const px = (size - w) / 2, py = (size - h) / 2;
+
+  m.fillStyle = '#0a0b10';
+  m.fillRect(0, 0, size, size);
+  m.imageSmoothingEnabled = false;
+  m.drawImage(off, 0, 0, S.W, S.H, px, py, w, h);
+
+  // the part of the canvas currently on screen
+  const vx = px + (-S.view.ox / S.view.scale) * s;
+  const vy = py + (-S.view.oy / S.view.scale) * s;
+  const vw = (r.width / S.view.scale) * s;
+  const vh = (r.height / S.view.scale) * s;
+  m.strokeStyle = '#ffffff';
+  m.lineWidth = 1;
+  m.strokeRect(Math.max(px, vx) + .5, Math.max(py, vy) + .5,
+    Math.min(vw, w), Math.min(vh, h));
 }
 
 function fitToScreen() {
@@ -277,6 +409,31 @@ function buildPalette() {
   });
 }
 
+// The dither modes come from template.js rather than being duplicated here, so
+// adding one is a single edit. If that script failed to load the feature is
+// removed from the page instead of offering a button that throws.
+function buildTemplateModes() {
+  if (!window.PFTemplate) {
+    $('btnTemplate').hidden = true;
+    el.tplPanel.hidden = true;
+    return;
+  }
+  const modes = window.PFTemplate.modes || [];
+  modes.forEach((m) => {
+    const o = document.createElement('option');
+    o.value = m.key;
+    o.textContent = m.name;
+    if (m.note) o.title = m.note;
+    el.tplMode.appendChild(o);
+  });
+  // Floyd–Steinberg by default: it is the one that makes a photograph look like
+  // the photograph, and somebody tracing line art will change it once and know
+  // why.
+  el.tplMode.value = modes.some((m) => m.key === 'floyd-steinberg')
+    ? 'floyd-steinberg'
+    : (modes[0] && modes[0].key) || 'none';
+}
+
 function selectColor(i) {
   if (i < 0 || i >= S.palette.length) return;
   S.color = i;
@@ -294,7 +451,9 @@ function cooldownTick() {
   if (left <= 0) {
     el.cdFill.style.strokeDashoffset = '0';
     el.cdFill.classList.remove('cooling');
-    el.cooldownText.textContent = 'ready';
+    // A room with no cooldown is never "ready" in the sense of having waited,
+    // and saying so every frame overwrote the label boot had set correctly.
+    el.cooldownText.textContent = S.cooldownMs === 0 ? 'no limit' : 'ready';
   } else {
     const frac = clamp(left / S.cooldownMs, 0, 1);
     el.cdFill.style.strokeDashoffset = String(circumference * frac);
@@ -324,6 +483,7 @@ function pushFeed(x, y, colorIndex) {
   li.appendChild(sw);
   li.appendChild(txt);
   el.feedList.prepend(li);
+  if (el.feedEmpty) el.feedEmpty.hidden = true;
   while (el.feedList.children.length > 40) el.feedList.lastChild.remove();
 }
 
@@ -376,6 +536,253 @@ function tryPlace(x, y) {
     S.readyAt = 0;
     toast('network error', 'bad');
   });
+}
+
+// ---------------------------------------------------------------- cursors --
+
+// Where somebody's pointer is right now is interesting for about a second, so
+// cursor updates travel only over the socket, only when the cell actually
+// changes, and at most every 60ms. If the socket is not available the feature
+// simply does not exist for that client: a position this perishable is not
+// worth a POST, and queueing one that missed its moment is worse than dropping
+// it.
+const CURSOR_MIN_GAP = 60;
+
+function sendCursor(cell) {
+  if (S.transport !== 'ws' || !S.socket || S.socket.readyState !== WebSocket.OPEN) return;
+  if (!cell) {
+    if (!S.cursorCell) return;
+    S.cursorCell = null;
+    S.socket.send('{"t":"curoff"}');
+    return;
+  }
+  const now = Date.now();
+  const same = S.cursorCell && S.cursorCell.x === cell.x && S.cursorCell.y === cell.y &&
+    S.cursorCell.c === S.color;
+  if (same || now - S.cursorSent < CURSOR_MIN_GAP) return;
+  S.cursorSent = now;
+  S.cursorCell = { x: cell.x, y: cell.y, c: S.color };
+  S.socket.send(JSON.stringify({ t: 'cur', x: cell.x, y: cell.y, c: S.color }));
+}
+
+// ---------------------------------------------------------------- template --
+
+function templateError(message) {
+  el.tplErr.hidden = !message;
+  el.tplErr.textContent = message || '';
+}
+
+function openTemplate() {
+  el.tplPanel.hidden = false;
+  templateError('');
+}
+
+function closeTemplate() {
+  el.tplPanel.hidden = true;
+  S.tplMove = false;
+  el.btnTplMove.classList.remove('on');
+}
+
+function clearTemplate() {
+  S.template = null;
+  S.templateSrc = null;
+  el.tplLoaded.hidden = true;
+  el.tplDrop.hidden = false;
+  el.tplFile.value = '';
+  S.tplMove = false;
+  el.btnTplMove.classList.remove('on');
+  templateError('');
+  S.dirty = true;
+}
+
+// The source file is kept rather than the decoded bitmap so that changing the
+// dither mode re-quantises from the original pixels. Re-deriving a template
+// from the already-quantised one would compound its errors every time somebody
+// tried a different setting.
+async function buildTemplate(keepOffset) {
+  if (!S.templateSrc) return;
+  const previous = S.template;
+  try {
+    const t = await window.PFTemplate.load(S.templateSrc, {
+      palette: S.palette,
+      maxW: S.W,
+      maxH: S.H,
+      dither: { mode: el.tplMode.value, avoidBackground: el.tplAvoidBg.checked },
+    });
+    // A template that lands centred is immediately visible; one that lands at
+    // 0,0 on a big canvas can be off screen entirely, which reads as nothing
+    // having happened.
+    if (keepOffset && previous) t.setOffset(previous.x, previous.y);
+    else t.setOffset(Math.floor((S.W - t.width) / 2), Math.floor((S.H - t.height) / 2));
+    S.template = t;
+    S.templateOn = true;
+    el.btnTplToggle.textContent = 'hide';
+    el.tplLoaded.hidden = false;
+    el.tplDrop.hidden = true;
+    el.tplSize.textContent = t.width + '×' + t.height;
+    templateError('');
+    refreshTemplate();
+  } catch (e) {
+    templateError(e && e.message ? e.message : 'that image could not be read');
+  }
+  S.dirty = true;
+}
+
+function loadTemplateFile(file) {
+  if (!file) return;
+  if (!/^image\//.test(file.type || '')) {
+    templateError('that is not an image');
+    return;
+  }
+  S.templateSrc = file;
+  buildTemplate(false);
+}
+
+let tplTimer = null;
+// Progress is recomputed on a timer rather than per placement: it walks the
+// whole template, and a busy canvas would otherwise pay for that walk on every
+// pixel anybody paints.
+function refreshTemplate() {
+  if (!S.template || tplTimer) return;
+  tplTimer = setTimeout(() => {
+    tplTimer = null;
+    if (!S.template || !S.pixels) return;
+    const p = S.template.progress(S.pixels, S.W);
+    S.template._next = p.nextMismatch;
+    const pct = p.total === 0 ? 100 : p.percent;
+    // Floored, not rounded: "100%" with two cells left to paint is a lie the
+    // person tracing it will find out about the hard way.
+    el.tplPercent.textContent = Math.floor(pct) + '%';
+    el.tplBar.style.width = pct.toFixed(1) + '%';
+    // Exact counts, not the abbreviated form used for the headline stats: this
+    // is a progress readout somebody is working against, and "645 of 6k" hides
+    // the last few hundred cells they still have to paint.
+    el.tplCount.textContent = p.done.toLocaleString() + ' of ' +
+      p.total.toLocaleString() + ' cells match';
+  }, 180);
+}
+
+// Sends the painter to the unpainted cell nearest the middle of the template
+// and picks the colour it needs, so tracing is click, click, click rather than
+// a hunt for the next difference.
+function jumpToNextCell() {
+  if (!S.template) return;
+  const p = S.template.progress(S.pixels, S.W);
+  if (!p.nextMismatch) { toast('the template is complete', 'good'); return; }
+  const { x, y, want } = p.nextMismatch;
+  selectColor(want);
+  const r = el.stage.getBoundingClientRect();
+  S.view.ox = r.width / 2 - (x + 0.5) * S.view.scale;
+  S.view.oy = r.height / 2 - (y + 0.5) * S.view.scale;
+  S.hover = { x, y };
+  el.coords.textContent = x + ', ' + y;
+  S.dirty = true;
+}
+
+// --------------------------------------------------------------- inspector --
+
+function closeInspect() {
+  el.inspectPanel.hidden = true;
+  S.inspect = null;
+  S.dirty = true;
+}
+
+function ago(ms) {
+  const s = Math.max(0, (Date.now() - ms) / 1000);
+  if (s < 60) return Math.floor(s) + 's ago';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+
+async function inspectCell(x, y) {
+  S.inspect = { x, y };
+  S.dirty = true;
+  el.inspectPanel.hidden = false;
+  el.inspectTitle.textContent = 'cell ' + x + ', ' + y;
+  el.inspectBody.textContent = 'looking…';
+
+  let data;
+  try {
+    const res = await fetch(API + '/pixel?x=' + x + '&y=' + y);
+    data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'could not read that cell');
+  } catch (e) {
+    el.inspectBody.textContent = e.message;
+    return;
+  }
+  if (!S.inspect || S.inspect.x !== x || S.inspect.y !== y) return;  // moved on
+
+  el.inspectBody.textContent = '';
+  const history = data.history || [];
+  if (!history.length) {
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = 'Nobody has painted here. This is the canvas as it started.';
+    el.inspectBody.appendChild(p);
+    return;
+  }
+
+  // Built as nodes rather than markup. Painter ids come from the server and are
+  // hex, but the moment history includes anything a person chose, an innerHTML
+  // here becomes the bug that lets them choose markup.
+  const ul = document.createElement('ul');
+  ul.className = 'history';
+  history.forEach((h, i) => {
+    const li = document.createElement('li');
+    if (h.undone) li.className = 'undone';
+
+    const sw = document.createElement('span');
+    sw.className = 'sw';
+    sw.style.background = S.palette[h.c] || '#000';
+    li.appendChild(sw);
+
+    const who = document.createElement('b');
+    const mine = data.you && h.uid === data.you;
+    who.textContent = mine ? 'you' : h.uid.slice(0, 6);
+    if (mine) who.className = 'mine';
+    else who.style.color = cursorColour(h.uid);
+    li.appendChild(who);
+
+    const when = document.createElement('span');
+    when.className = 'when';
+    when.textContent = (i === 0 && !h.undone ? '' : h.undone ? 'undone · ' : 'was · ') + ago(h.t);
+    li.appendChild(when);
+
+    ul.appendChild(li);
+  });
+  el.inspectBody.appendChild(ul);
+
+  if (history.length >= 12) {
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = 'Showing the twelve most recent.';
+    el.inspectBody.appendChild(p);
+  }
+}
+
+// -------------------------------------------------------------------- undo --
+
+// Undo asks the server rather than reversing the pixel locally, because only
+// the placement log knows what was underneath. The server refuses when somebody
+// else has painted over it since, and that refusal is the point: taking back
+// your pixel should never quietly erase theirs.
+async function undoMine() {
+  if (S.lapse) { toast('exit time-lapse first'); return; }
+  try {
+    const res = await fetch(API + '/undo', { method: 'POST' });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      toast(body.error || 'could not undo', res.status === 409 ? 'warn' : 'bad');
+      return;
+    }
+    writePixel(body.x, body.y, body.c);
+    S.readyAt = 0;   // the server clears the cooldown too; do not make them wait for the round trip
+    toast('took back ' + body.x + ', ' + body.y);
+    refreshTemplate();
+  } catch (e) {
+    toast('network error', 'bad');
+  }
 }
 
 // -------------------------------------------------------------- transport --
@@ -485,6 +892,7 @@ function handleBinary(buf) {
     S.placements++;
   }
   el.statPlacements.textContent = fmt(S.placements);
+  refreshTemplate();
 }
 
 function handleJSON(raw) {
@@ -493,10 +901,17 @@ function handleJSON(raw) {
   switch (msg.t) {
     case 'hello':
       S.seq = msg.seq || 0;
+      if (msg.uid) S.uid = msg.uid;
       if (typeof msg.clients === 'number') el.statClients.textContent = fmt(msg.clients);
       break;
     case 'presence':
       el.statClients.textContent = fmt(msg.n);
+      break;
+    case 'cursors':
+      // The room broadcasts every cursor, ours included. Drawing our own would
+      // put a second, laggier pointer a frame behind the real one.
+      S.cursors = (msg.c || []).filter((c) => c.u !== S.uid);
+      S.dirty = true;
       break;
     case 'px':
       (msg.p || []).forEach((p, i) => {
@@ -534,6 +949,7 @@ function handleJSON(raw) {
       break;
   }
   updatePaintedStat();
+  refreshTemplate();
 }
 
 let paintedTimer = null;
@@ -682,8 +1098,25 @@ function helpSheet() {
       <tr><td>Fit to screen</td><td><kbd>F</kbd></td></tr>
       <tr><td>Pick a colour</td><td><kbd>1</kbd>…<kbd>9</kbd> <kbd>0</kbd></td></tr>
       <tr><td>Eyedropper</td><td>hold <kbd>Alt</kbd> and click</td></tr>
+      <tr><td>Who painted this?</td><td>hold <kbd>Shift</kbd> and click</td></tr>
+      <tr><td>Take back your last pixel</td><td><kbd>Ctrl</kbd>/<kbd>⌘</kbd> <kbd>Z</kbd></td></tr>
+      <tr><td>Template overlay</td><td><kbd>T</kbd>, or drop an image</td></tr>
+      <tr><td>Next cell to paint</td><td><kbd>N</kbd></td></tr>
+      <tr><td>Hide the template</td><td><kbd>H</kbd></td></tr>
       <tr><td>Close a panel</td><td><kbd>Esc</kbd></td></tr>
     </table>
+    <h3>Tracing an image</h3>
+    <p>Drop a picture onto the canvas and it is resized to fit, quantised to
+    this room's palette and drawn underneath as a ghost. <kbd>N</kbd> sends you
+    to the cell nearest the middle that does not match yet and picks the colour
+    it needs, so tracing is click, click, click.</p>
+    <p>The image is decoded in your browser and never uploaded. Nobody else can
+    see what you are copying, and the server never learns you used one.</p>
+    <h3>Undo</h3>
+    <p>Undo takes back your most recent pixel and restores whatever was
+    underneath, read from the placement log rather than guessed. It refuses if
+    somebody has painted over it since &mdash; taking back your pixel should
+    never quietly erase theirs.</p>
     <h3>How it works</h3>
     <p>The Go server keeps the authoritative grid in memory, appends every
     placement to PostgreSQL through a hand-written wire-protocol driver, and
@@ -907,8 +1340,16 @@ function bindInput() {
   let dragging = false, moved = false, lastX = 0, lastY = 0, downX = 0, downY = 0;
   const pointers = new Map();
   let pinchDist = 0;
+  let tplGrab = null;
 
   el.stage.addEventListener('pointerdown', (e) => {
+    // Only the canvas is a painting surface. The zoom box, the panels, the
+    // minimap and the time-lapse bar are all children of the stage, and
+    // capturing the pointer for one of their buttons retargets the pointerup to
+    // the stage: the click event is then dispatched at the common ancestor, so
+    // the button never hears about it, and the gesture is treated as a
+    // placement on the cell underneath instead.
+    if (e.target !== el.board && e.target !== el.stage) return;
     el.stage.setPointerCapture(e.pointerId);
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (pointers.size === 2) {
@@ -919,6 +1360,12 @@ function bindInput() {
     dragging = true; moved = false;
     lastX = downX = e.clientX; lastY = downY = e.clientY;
     if (S.lockMode) { S.lockStart = screenToCell(e.clientX, e.clientY); }
+    if (S.tplMove && S.template) {
+      // Grab the template by the point under the pointer so it moves with the
+      // hand rather than jumping its corner to the cursor.
+      const cell = screenToCell(e.clientX, e.clientY);
+      tplGrab = cell ? { dx: S.template.x - cell.x, dy: S.template.y - cell.y } : { dx: 0, dy: 0 };
+    }
   });
 
   el.stage.addEventListener('pointermove', (e) => {
@@ -943,6 +1390,18 @@ function bindInput() {
     if (changed) {
       el.coords.textContent = cell ? cell.x + ', ' + cell.y : '–, –';
       S.dirty = true;
+    }
+    sendCursor(cell);
+
+    if (S.tplMove && S.template && tplGrab && dragging) {
+      if (cell) {
+        S.template.setOffset(cell.x + tplGrab.dx, cell.y + tplGrab.dy);
+        refreshTemplate();
+        S.dirty = true;
+      }
+      moved = true;
+      lastX = e.clientX; lastY = e.clientY;
+      return;
     }
 
     if (S.lockMode && S.lockStart && dragging) {
@@ -971,6 +1430,11 @@ function bindInput() {
     dragging = false;
     el.stage.classList.remove('panning');
 
+    if (S.tplMove && tplGrab) {
+      tplGrab = null;
+      return;
+    }
+
     if (S.lockMode) {
       const end = screenToCell(e.clientX, e.clientY) || S.lockEnd;
       if (S.lockStart && end) commitLock(S.lockStart, end);
@@ -982,11 +1446,19 @@ function bindInput() {
     const cell = screenToCell(e.clientX, e.clientY);
     if (!cell) return;
     if (e.altKey) { selectColor(S.pixels[cell.y * S.W + cell.x]); toast('picked ' + S.palette[S.color]); return; }
+    // Shift turns a click into a question instead of a placement. Asking who
+    // painted something must never risk painting over it.
+    if (e.shiftKey) { inspectCell(cell.x, cell.y); return; }
     tryPlace(cell.x, cell.y);
   };
   el.stage.addEventListener('pointerup', endPointer);
-  el.stage.addEventListener('pointercancel', (e) => { pointers.delete(e.pointerId); dragging = false; el.stage.classList.remove('panning'); });
-  el.stage.addEventListener('pointerleave', () => { S.hover = null; el.coords.textContent = '–, –'; S.dirty = true; });
+  el.stage.addEventListener('pointercancel', (e) => { pointers.delete(e.pointerId); dragging = false; tplGrab = null; el.stage.classList.remove('panning'); });
+  el.stage.addEventListener('pointerleave', () => {
+    S.hover = null;
+    el.coords.textContent = '–, –';
+    sendCursor(null);
+    S.dirty = true;
+  });
 
   el.stage.addEventListener('wheel', (e) => {
     e.preventDefault();
@@ -1002,8 +1474,21 @@ function bindInput() {
   });
 
   window.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z')) {
+      e.preventDefault();
+      undoMine();
+      return;
+    }
     if (e.metaKey || e.ctrlKey) return;
-    if (e.key === 'Escape') { closeSheet(); if (S.lapse) exitTimelapse(); return; }
+    // Typing into the template panel's controls should type, not paint.
+    const tag = (e.target && e.target.tagName) || '';
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+    if (e.key === 'Escape') {
+      closeSheet();
+      if (S.inspect) closeInspect();
+      if (S.lapse) exitTimelapse();
+      return;
+    }
     if (e.key >= '0' && e.key <= '9') { selectColor(e.key === '0' ? 10 : Number(e.key)); return; }
     switch (e.key) {
       case 'f': case 'F': fitToScreen(); break;
@@ -1013,6 +1498,11 @@ function bindInput() {
       case 'ArrowRight': S.view.ox -= 40; S.dirty = true; e.preventDefault(); break;
       case 'ArrowUp':    S.view.oy += 40; S.dirty = true; e.preventDefault(); break;
       case 'ArrowDown':  S.view.oy -= 40; S.dirty = true; e.preventDefault(); break;
+      case 't': case 'T': el.tplPanel.hidden ? openTemplate() : closeTemplate(); break;
+      case 'n': case 'N': jumpToNextCell(); break;
+      case 'h': case 'H':
+        if (S.template) { el.btnTplToggle.click(); }
+        break;
       case '?': helpSheet(); break;
     }
   });
@@ -1035,6 +1525,75 @@ function bindInput() {
     S.reconnectDelay = 500;
     toast('switched to ' + (S.transport === 'ws' ? 'WebSocket' : 'Server-Sent Events'));
     connect();
+  });
+
+  // ---- template ----
+  $('btnTemplate').addEventListener('click', () => {
+    el.tplPanel.hidden ? openTemplate() : closeTemplate();
+  });
+  $('btnTplClose').addEventListener('click', closeTemplate);
+  el.tplDrop.addEventListener('click', () => el.tplFile.click());
+  el.tplDrop.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.tplFile.click(); }
+  });
+  el.tplFile.addEventListener('change', () => loadTemplateFile(el.tplFile.files[0]));
+  ['dragenter', 'dragover'].forEach((ev) => el.tplDrop.addEventListener(ev, (e) => {
+    e.preventDefault();
+    el.tplDrop.classList.add('over');
+  }));
+  ['dragleave', 'drop'].forEach((ev) => el.tplDrop.addEventListener(ev, (e) => {
+    e.preventDefault();
+    el.tplDrop.classList.remove('over');
+  }));
+  el.tplDrop.addEventListener('drop', (e) => {
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    loadTemplateFile(f);
+  });
+  // Dropping onto the canvas is what people try first, so accept it there too
+  // and open the panel for them rather than letting the browser navigate away
+  // to the image they just dropped.
+  ['dragover', 'drop'].forEach((ev) => el.stage.addEventListener(ev, (e) => e.preventDefault()));
+  el.stage.addEventListener('drop', (e) => {
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (!f) return;
+    openTemplate();
+    loadTemplateFile(f);
+  });
+  el.tplMode.addEventListener('change', () => buildTemplate(true));
+  el.tplAvoidBg.addEventListener('change', () => buildTemplate(true));
+  el.btnTplMove.addEventListener('click', () => {
+    S.tplMove = !S.tplMove;
+    el.btnTplMove.classList.toggle('on', S.tplMove);
+    toast(S.tplMove ? 'drag on the canvas to position the template' : 'positioning off');
+  });
+  $('btnTplNext').addEventListener('click', jumpToNextCell);
+  el.btnTplToggle.addEventListener('click', () => {
+    S.templateOn = !S.templateOn;
+    el.btnTplToggle.textContent = S.templateOn ? 'hide' : 'show';
+    S.dirty = true;
+  });
+  $('btnTplClear').addEventListener('click', clearTemplate);
+
+  // ---- inspector and undo ----
+  $('btnInspectClose').addEventListener('click', closeInspect);
+  el.btnUndo.addEventListener('click', undoMine);
+
+  // ---- minimap ----
+  // The overview is only worth showing when it tells you something, so it also
+  // has to be worth clicking: tapping it recentres the view there.
+  el.minimap.addEventListener('click', (e) => {
+    const box = el.minimap.getBoundingClientRect();
+    const size = 128;
+    const s = Math.min(size / S.W, size / S.H);
+    const px = (size - S.W * s) / 2, py = (size - S.H * s) / 2;
+    const mx = ((e.clientX - box.left) / box.width) * size;
+    const my = ((e.clientY - box.top) / box.height) * size;
+    const cx = clamp((mx - px) / s, 0, S.W);
+    const cy = clamp((my - py) / s, 0, S.H);
+    const r = el.stage.getBoundingClientRect();
+    S.view.ox = r.width / 2 - cx * S.view.scale;
+    S.view.oy = r.height / 2 - cy * S.view.scale;
+    S.dirty = true;
   });
 
   $('btnLapse').addEventListener('click', () => { if (S.lapse) exitTimelapse(); else startTimelapse(); });
@@ -1098,6 +1657,7 @@ async function boot() {
   el.btnGif.href = '/r/' + SLUG + '/timelapse.gif';
 
   buildPalette();
+  buildTemplateModes();
   resize();
 
   try {

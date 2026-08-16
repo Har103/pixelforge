@@ -86,6 +86,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/r/{slug}/place", s.withRoom(s.handlePlace))
 	mux.HandleFunc("GET /api/r/{slug}/history", s.withRoom(s.handleHistory))
 	mux.HandleFunc("GET /api/r/{slug}/stats", s.withRoom(s.handleStats))
+	mux.HandleFunc("GET /api/r/{slug}/pixel", s.withRoom(s.handlePixel))
+	mux.HandleFunc("POST /api/r/{slug}/undo", s.withRoom(s.handleUndoOwn))
 	mux.HandleFunc("GET /api/r/{slug}/ws", s.withRoom(s.handleWS))
 	mux.HandleFunc("GET /api/r/{slug}/sse", s.withRoom(s.handleSSE))
 

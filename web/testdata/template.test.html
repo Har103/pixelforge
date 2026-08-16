@@ -1,0 +1,345 @@
+<!doctype html>
+<!--
+  A standalone harness for template.js. Open it directly from disk — file:// is
+  the point, because it means the module can be exercised without the Go server,
+  a room, a palette endpoint or a WebSocket.
+
+  It is deliberately plain and dense. The styles and the driving script are
+  inline so the whole harness is one file you can copy anywhere; that is also
+  why it is not meant to be served from /assets, where the Content Security
+  Policy would rightly refuse to run it.
+
+  Nothing here uploads anything. The image you drop is decoded by the browser,
+  quantised in this tab and drawn back to a canvas, and that is the entire
+  journey it makes.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PFTemplate harness</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 16px;
+    background: #0a0b10; color: #c9d1e6;
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  h1 { font-size: 14px; margin: 0 0 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: #8f9ab8; }
+  fieldset { border: 1px solid #262b38; margin: 0 0 12px; padding: 8px 12px 10px; }
+  legend { color: #8f9ab8; padding: 0 6px; }
+  .row { display: flex; flex-wrap: wrap; gap: 18px; align-items: center; }
+  label { user-select: none; }
+  select, input[type=number] { background: #14171f; color: #c9d1e6; border: 1px solid #3f4658; padding: 3px 5px; font: inherit; }
+  #drop {
+    border: 1px dashed #3f4658; padding: 14px; text-align: center; color: #8f9ab8;
+    margin: 0 0 12px; cursor: pointer;
+  }
+  #drop.over { border-color: #3a86ff; color: #c9d1e6; background: #12141c; }
+  .panes { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+  .pane h2 { font-size: 12px; margin: 0 0 6px; color: #8f9ab8; font-weight: 600; }
+  canvas { display: block; border: 1px solid #262b38; image-rendering: pixelated; background: #12141c; }
+  table { border-collapse: collapse; margin-top: 12px; }
+  td { padding: 1px 14px 1px 0; vertical-align: top; }
+  td:first-child { color: #8f9ab8; }
+  .err { color: #ff4d6d; white-space: pre-wrap; }
+  .swatches { display: flex; flex-wrap: wrap; gap: 2px; margin-top: 6px; }
+  .swatches i { width: 14px; height: 14px; display: block; outline: 1px solid #0a0b10; }
+</style>
+</head>
+<body>
+
+<h1>PFTemplate harness</h1>
+
+<div id="drop">Drop an image here, or <input type="file" id="file" accept="image/*"></div>
+
+<fieldset>
+  <legend>palette</legend>
+  <div class="row">
+    <label>set <select id="palette"></select></label>
+    <label><input type="checkbox" id="avoid"> avoidBackground (never quantise to index 0)</label>
+  </div>
+  <div class="swatches" id="swatches"></div>
+</fieldset>
+
+<fieldset>
+  <legend>dither</legend>
+  <div class="row" id="modes"></div>
+</fieldset>
+
+<fieldset>
+  <legend>fit</legend>
+  <div class="row">
+    <label>maxW <input type="number" id="maxW" value="128" min="1" max="1024" step="1"></label>
+    <label>maxH <input type="number" id="maxH" value="128" min="1" max="1024" step="1"></label>
+    <label><input type="checkbox" id="upscale"> upscale a small source</label>
+  </div>
+</fieldset>
+
+<div class="panes">
+  <div class="pane">
+    <h2>source</h2>
+    <canvas id="orig" width="512" height="512"></canvas>
+  </div>
+  <div class="pane">
+    <h2>template &middot; 4&times; zoom, over the background colour</h2>
+    <canvas id="out" width="512" height="512"></canvas>
+  </div>
+  <div class="pane">
+    <h2>numbers</h2>
+    <table>
+      <tr><td>source</td><td id="nSource">&ndash;</td></tr>
+      <tr><td>template</td><td id="nSize">&ndash;</td></tr>
+      <tr><td>cells to paint</td><td id="nCells">&ndash;</td></tr>
+      <tr><td>transparent</td><td id="nClear">&ndash;</td></tr>
+      <tr><td>colours used</td><td id="nColours">&ndash;</td></tr>
+      <tr><td>index 0 used</td><td id="nZero">&ndash;</td></tr>
+      <tr><td>quantise time</td><td id="nTime">&ndash;</td></tr>
+      <tr><td>progress vs blank</td><td id="nProgress">&ndash;</td></tr>
+      <tr><td>next target</td><td id="nNext">&ndash;</td></tr>
+    </table>
+    <p class="err" id="err"></p>
+  </div>
+</div>
+
+<script src="../assets/template.js"></script>
+<script>
+'use strict';
+
+(() => {
+
+// The two palettes are copied from internal/canvas/palettes.go rather than
+// fetched, so the harness has no dependency on a running server.
+const PALETTES = {
+  classic: {
+    name: 'Classic (20 colours)',
+    colors: [
+      '#12141c', '#ffffff', '#b8c1d9', '#6b7899', '#3a4361', '#000000',
+      '#ff4d6d', '#d90429', '#8b1e3f', '#ff9f1c', '#ffd60a', '#8ac926',
+      '#2a9d8f', '#00b4d8', '#3a86ff', '#5f27cd', '#c77dff', '#ff70a6',
+      '#7f5539', '#c98f5f',
+    ],
+  },
+  gameboy: {
+    name: 'Game Boy (4 colours)',
+    colors: ['#0f380f', '#306230', '#8bac0f', '#9bbc0f'],
+  },
+};
+
+const $ = (id) => document.getElementById(id);
+const el = {
+  drop: $('drop'), file: $('file'), palette: $('palette'), avoid: $('avoid'),
+  swatches: $('swatches'), modes: $('modes'), maxW: $('maxW'), maxH: $('maxH'),
+  upscale: $('upscale'), orig: $('orig'), out: $('out'), err: $('err'),
+};
+
+const ZOOM = 4;
+const origCtx = el.orig.getContext('2d');
+const outCtx = el.out.getContext('2d');
+const scratch = document.createElement('canvas');
+const scratchCtx = scratch.getContext('2d');
+
+let source = null;   // an ImageBitmap or a <canvas>, whatever we last decoded
+
+// ------------------------------------------------------------------ controls
+
+for (const key of Object.keys(PALETTES)) {
+  const o = document.createElement('option');
+  o.value = key;
+  o.textContent = PALETTES[key].name;
+  el.palette.appendChild(o);
+}
+
+window.PFTemplate.modes.forEach((m, i) => {
+  const label = document.createElement('label');
+  const radio = document.createElement('input');
+  radio.type = 'radio';
+  radio.name = 'mode';
+  radio.value = m.key;
+  radio.checked = i === 0;
+  radio.addEventListener('change', render);
+  label.appendChild(radio);
+  label.appendChild(document.createTextNode(' ' + m.name));
+  label.title = m.note;
+  el.modes.appendChild(label);
+});
+
+const currentMode = () => el.modes.querySelector('input:checked').value;
+const currentPalette = () => PALETTES[el.palette.value].colors;
+
+function drawSwatches() {
+  el.swatches.innerHTML = '';
+  currentPalette().forEach((hex, i) => {
+    const i2 = document.createElement('i');
+    i2.style.background = hex;
+    i2.title = i + ' ' + hex + (i === 0 ? ' (background)' : '');
+    el.swatches.appendChild(i2);
+  });
+}
+
+['change', 'input'].forEach((ev) => {
+  [el.palette, el.avoid, el.maxW, el.maxH, el.upscale].forEach((n) => n.addEventListener(ev, () => {
+    drawSwatches();
+    render();
+  }));
+});
+
+// ---------------------------------------------------------------- the source
+
+// Something to look at before a file has been chosen: a gradient, a few hard
+// shapes and a soft-edged disc, which between them exercise tone, flat colour
+// and the alpha cutoff.
+function syntheticSource() {
+  const c = document.createElement('canvas');
+  c.width = 360;
+  c.height = 240;
+  const g = c.getContext('2d');
+  g.clearRect(0, 0, c.width, c.height);
+  const grad = g.createLinearGradient(0, 0, c.width, c.height);
+  grad.addColorStop(0, '#ff9f1c');
+  grad.addColorStop(0.5, '#c77dff');
+  grad.addColorStop(1, '#00b4d8');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, c.width, 170);
+  g.fillStyle = '#12141c';
+  g.fillRect(24, 24, 90, 60);
+  g.fillStyle = '#ffffff';
+  g.font = 'bold 44px sans-serif';
+  g.fillText('trace', 26, 140);
+  // A disc with a feathered edge, so some cells land either side of the cutoff.
+  const soft = g.createRadialGradient(280, 100, 10, 280, 100, 62);
+  soft.addColorStop(0, 'rgba(138,201,38,1)');
+  soft.addColorStop(0.75, 'rgba(138,201,38,1)');
+  soft.addColorStop(1, 'rgba(138,201,38,0)');
+  g.fillStyle = soft;
+  g.beginPath();
+  g.arc(280, 100, 62, 0, Math.PI * 2);
+  g.fill();
+  return c;
+}
+
+function accept(file) {
+  if (!file) return;
+  el.err.textContent = '';
+  // createImageBitmap keeps the bytes local and, unlike an <img> with an object
+  // URL, stays origin-clean on a file:// page so the readback is not tainted.
+  createImageBitmap(file).then((bmp) => {
+    if (source && typeof source.close === 'function') source.close();
+    source = bmp;
+    render();
+  }).catch((e) => { el.err.textContent = String(e && e.message || e); });
+}
+
+el.file.addEventListener('change', () => accept(el.file.files[0]));
+el.drop.addEventListener('click', (e) => { if (e.target !== el.file) el.file.click(); });
+['dragenter', 'dragover'].forEach((ev) => el.drop.addEventListener(ev, (e) => {
+  e.preventDefault();
+  el.drop.classList.add('over');
+}));
+['dragleave', 'drop'].forEach((ev) => el.drop.addEventListener(ev, (e) => {
+  e.preventDefault();
+  el.drop.classList.remove('over');
+}));
+el.drop.addEventListener('drop', (e) => accept(e.dataTransfer.files[0]));
+
+// ---------------------------------------------------------------- rendering
+
+function drawSource() {
+  const sw = source.width, sh = source.height;
+  const k = Math.min(el.orig.width / sw, el.orig.height / sh);
+  const w = Math.round(sw * k), h = Math.round(sh * k);
+  origCtx.clearRect(0, 0, el.orig.width, el.orig.height);
+  origCtx.fillStyle = currentPalette()[0];
+  origCtx.fillRect(0, 0, el.orig.width, el.orig.height);
+  origCtx.imageSmoothingEnabled = true;
+  origCtx.drawImage(source, 0, 0, sw, sh, (el.orig.width - w) / 2, (el.orig.height - h) / 2, w, h);
+  $('nSource').textContent = sw + ' × ' + sh;
+}
+
+function drawTemplate(t, palette) {
+  scratch.width = t.width;
+  scratch.height = t.height;
+  scratchCtx.putImageData(new ImageData(t.rgba(palette), t.width, t.height), 0, 0);
+
+  el.out.width = t.width * ZOOM;
+  el.out.height = t.height * ZOOM;
+  outCtx.imageSmoothingEnabled = false;
+  // The background colour underneath, because that is what the template will
+  // actually sit on and it is the only way to see whether index 0 has eaten a
+  // hole in the middle of the picture.
+  outCtx.fillStyle = palette[0];
+  outCtx.fillRect(0, 0, el.out.width, el.out.height);
+  outCtx.drawImage(scratch, 0, 0, t.width, t.height, 0, 0, el.out.width, el.out.height);
+}
+
+function markNext(t, next) {
+  if (!next) return;
+  // next is in canvas coordinates and the template is drawn at offset 0,0 here,
+  // so the two agree. Worth drawing: it is the quickest way to see that the
+  // target really does start in the middle rather than the top-left corner.
+  outCtx.strokeStyle = '#ff4d6d';
+  outCtx.lineWidth = 2;
+  outCtx.strokeRect((next.x - t.x) * ZOOM - 1, (next.y - t.y) * ZOOM - 1, ZOOM + 2, ZOOM + 2);
+}
+
+function render() {
+  if (!source) return;
+  drawSource();
+
+  const palette = currentPalette();
+  const opts = {
+    palette,
+    maxW: Math.max(1, parseInt(el.maxW.value, 10) || 1),
+    maxH: Math.max(1, parseInt(el.maxH.value, 10) || 1),
+    dither: { mode: currentMode(), avoidBackground: el.avoid.checked },
+    upscale: el.upscale.checked,
+  };
+
+  const t0 = performance.now();
+  window.PFTemplate.load(source, opts).then((t) => {
+    const ms = performance.now() - t0;
+    el.err.textContent = '';
+    drawTemplate(t, palette);
+
+    let cells = 0, zero = 0;
+    const seen = new Set();
+    for (let i = 0; i < t.mask.length; i++) {
+      if (!t.mask[i]) continue;
+      cells++;
+      seen.add(t.indices[i]);
+      if (t.indices[i] === 0) zero++;
+    }
+
+    $('nSize').textContent = t.width + ' × ' + t.height + ' cells';
+    $('nCells').textContent = cells.toLocaleString();
+    $('nClear').textContent = (t.mask.length - cells).toLocaleString() + ' of ' + t.mask.length.toLocaleString();
+    $('nColours').textContent = seen.size + ' of ' + palette.length;
+    $('nZero').textContent = zero.toLocaleString() + ' cell' + (zero === 1 ? '' : 's');
+    $('nTime').textContent = ms.toFixed(1) + ' ms';
+
+    // A blank canvas the size of the fit, so progress() gets exercised for real
+    // rather than just being present.
+    const blank = new Uint8Array(opts.maxW * opts.maxH);
+    t.setOffset(0, 0);
+    const p = t.progress(blank, opts.maxW);
+    $('nProgress').textContent = p.done.toLocaleString() + ' / ' + p.total.toLocaleString() +
+      ' (' + p.percent.toFixed(1) + '%)';
+    $('nNext').textContent = p.nextMismatch
+      ? p.nextMismatch.x + ', ' + p.nextMismatch.y + '  want ' + p.nextMismatch.want +
+        ' (' + palette[p.nextMismatch.want] + ')'
+      : 'none, it is finished';
+    markNext(t, p.nextMismatch);
+  }).catch((e) => {
+    el.err.textContent = String(e && e.message || e);
+  });
+}
+
+drawSwatches();
+source = syntheticSource();
+render();
+
+})();
+</script>
+
+</body>
+</html>

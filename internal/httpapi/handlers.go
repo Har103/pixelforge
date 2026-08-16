@@ -88,6 +88,16 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request, rm *room.Room)
 			continue
 		}
 		switch msg.T {
+		case "cur":
+			// Cursor traffic is chatty and worthless if stale, so it bypasses
+			// the rate limiter and is simply recorded. The room drops anything
+			// out of bounds and expires it on its own.
+			rm.SetCursor(uid, msg.X, msg.Y, uint8(msg.C))
+		case "curoff":
+			// Moving the pointer off the canvas should take it away now rather
+			// than leaving it parked for the length of the TTL, which reads as
+			// somebody standing perfectly still.
+			rm.DropCursor(uid)
 		case "place":
 			if !s.limiter.allow(clientIP(r)) {
 				s.rejected.Add(1)
@@ -114,6 +124,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request, rm *room.Room)
 		}
 	}
 
+	rm.DropCursor(uid)
 	rm.Hub.Unsubscribe(sub)
 	<-done
 	_ = conn.Close()
@@ -122,7 +133,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request, rm *room.Room)
 // handleSSE is the fallback for networks or proxies that will not carry an
 // upgrade. It is one-way, so the client POSTs placements instead.
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request, rm *room.Room) {
-	s.painterID(w, r)
+	uid := s.painterID(w, r)
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -137,8 +148,12 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request, rm *room.Room
 	w.WriteHeader(http.StatusOK)
 
 	fmt.Fprint(w, "retry: 2000\n\n")
+	// The painter id travels in the greeting on this transport too. A client
+	// that does not know who it is cannot tell its own cursor from a stranger's
+	// and ends up drawing a second, laggier pointer under its own.
 	hello, _ := json.Marshal(map[string]any{
-		"t": "hello", "seq": rm.Canvas.Seq(), "clients": rm.Hub.Count(), "paused": rm.Paused(),
+		"t": "hello", "uid": uid, "seq": rm.Canvas.Seq(),
+		"clients": rm.Hub.Count(), "paused": rm.Paused(),
 	})
 	fmt.Fprintf(w, "data: %s\n\n", hello)
 	flusher.Flush()
@@ -172,6 +187,68 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request, rm *room.Room
 			flusher.Flush()
 		}
 	}
+}
+
+// ------------------------------------------------------- pixel provenance --
+
+// handlePixel answers "who painted this cell, and what was underneath". It is
+// the question that turns a grid into something people argue about, and it is
+// also what makes moderation possible without guessing.
+func (s *Server) handlePixel(w http.ResponseWriter, r *http.Request, rm *room.Room) {
+	x, errX := strconv.Atoi(r.URL.Query().Get("x"))
+	y, errY := strconv.Atoi(r.URL.Query().Get("y"))
+	if errX != nil || errY != nil ||
+		x < 0 || y < 0 || x >= rm.Canvas.Width() || y >= rm.Canvas.Height() {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "coordinates outside the canvas"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	history, err := s.Store.CellHistory(ctx, rm.Meta.ID, x, y, 12)
+	if err != nil {
+		s.Log.Warn("cell history", "room", rm.Slug(), "err", err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "history unavailable"})
+		return
+	}
+
+	pixels, _ := rm.Canvas.Snapshot()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"x": x, "y": y,
+		"colour":  pixels[y*rm.Canvas.Width()+x],
+		"history": history,
+		"you":     s.painterID(w, r),
+	})
+}
+
+// handleUndoOwn reverts the caller's most recent placement.
+func (s *Server) handleUndoOwn(w http.ResponseWriter, r *http.Request, rm *room.Room) {
+	uid := s.painterID(w, r)
+	if !s.limiter.allow(clientIP(r)) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "slow down"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+
+	px, err := rm.UndoOwn(ctx, uid)
+	switch {
+	case errors.Is(err, room.ErrNothingToUndo):
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "you have not painted here yet"})
+		return
+	case errors.Is(err, room.ErrPaintedOver):
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": "somebody has painted over that since, so undoing it would erase their pixel",
+		})
+		return
+	case err != nil:
+		s.Log.Error("undoing own placement", "room", rm.Slug(), "err", err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "could not undo"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "x": px.X, "y": px.Y, "c": px.Color})
 }
 
 // ------------------------------------------------------------ moderation ---

@@ -57,6 +57,59 @@
 <main class="stage" id="stage">
   <canvas id="board" aria-label="Shared pixel canvas"></canvas>
 
+  <!-- The template panel is a reference image quantised to the room's palette
+       and drawn under the canvas as a guide. The image is read in the browser
+       and never uploaded: a picture you are only using to line up your own
+       pixels is nobody else's business, least of all the server's. -->
+  <aside class="panel panel-tpl" id="tplPanel" hidden aria-label="Template overlay">
+    <div class="panel-head">
+      <span>template</span>
+      <button class="ghost sq" id="btnTplClose" aria-label="Close template panel">×</button>
+    </div>
+
+    <div class="panel-body">
+      <label class="dropzone" id="tplDrop" tabindex="0">
+        <input type="file" id="tplFile" accept="image/*" hidden>
+        <span class="dropzone-title">drop an image</span>
+        <span class="dropzone-sub">or click to choose · never leaves this browser</span>
+      </label>
+
+      <div id="tplLoaded" hidden>
+        <div class="row">
+          <span class="row-label">dither</span>
+          <select id="tplMode" class="ghost sel-input"></select>
+        </div>
+        <label class="row check">
+          <input type="checkbox" id="tplAvoidBg">
+          <span>keep off the background colour</span>
+        </label>
+
+        <div class="tpl-progress">
+          <div class="tpl-progress-top">
+            <span id="tplSize" class="mono">–</span>
+            <span id="tplPercent" class="mono">0%</span>
+          </div>
+          <div class="bar"><i id="tplBar" style="width:0%"></i></div>
+          <p class="tpl-count" id="tplCount">0 of 0 cells match</p>
+        </div>
+
+        <div class="row btns">
+          <button class="ghost sm" id="btnTplMove" title="Then drag on the canvas">position</button>
+          <button class="ghost sm" id="btnTplNext" title="Jump to the next cell that does not match, and pick its colour">next cell</button>
+        </div>
+        <div class="row btns">
+          <button class="ghost sm" id="btnTplToggle">hide</button>
+          <button class="ghost sm" id="btnTplClear">remove</button>
+        </div>
+      </div>
+
+      <p class="panel-err" id="tplErr" hidden></p>
+    </div>
+  </aside>
+
+  <canvas id="minimap" class="minimap" width="128" height="128"
+          title="Click to jump there" aria-label="Canvas overview" hidden></canvas>
+
   <div class="hud-left">
     <div class="coords" id="coords">–, –</div>
     <div class="zoombox">
@@ -67,10 +120,27 @@
     </div>
   </div>
 
-  <aside class="feed" id="feed" aria-live="polite" aria-label="Live activity">
-    <div class="feed-head">live</div>
-    <ul id="feedList"></ul>
-  </aside>
+  <!-- The feed and the cell inspector share the right-hand column so the
+       inspector opens directly under the feed instead of floating at whatever
+       height the feed happened to grow to. -->
+  <div class="hud-right">
+    <aside class="feed" id="feed" aria-live="polite" aria-label="Live activity">
+      <div class="feed-head">live</div>
+      <ul id="feedList"></ul>
+      <p class="feed-empty" id="feedEmpty">waiting for the next pixel</p>
+    </aside>
+
+    <!-- Provenance. A canvas where nobody can ask "who painted this, and what
+         was here before" is a grid; being able to ask is what makes it a
+         place. -->
+    <aside class="panel panel-inspect" id="inspectPanel" hidden aria-label="Cell history">
+      <div class="panel-head">
+        <span id="inspectTitle">cell</span>
+        <button class="ghost sq" id="btnInspectClose" aria-label="Close cell history">×</button>
+      </div>
+      <div class="panel-body" id="inspectBody"></div>
+    </aside>
+  </div>
 
   <div class="timelapse" id="timelapse" hidden>
     <button class="ghost sq" id="btnPlay" aria-label="Play or pause">▶</button>
@@ -93,6 +163,8 @@
   <div class="palette" id="palette" role="radiogroup" aria-label="Colour palette"></div>
 
   <div class="dock-actions">
+    <button class="ghost" id="btnUndo" title="Take back your last pixel (Ctrl/⌘+Z)">undo</button>
+    <button class="ghost" id="btnTemplate" title="Trace over a reference image">template</button>
     <button class="ghost" id="btnLapse" title="Replay how the canvas was built">time-lapse</button>
     <button class="ghost" id="btnStats" title="Canvas statistics">stats</button>
   </div>
@@ -107,6 +179,7 @@
 
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
+<script src="/assets/template.js"></script>
 <script src="/assets/app.js"></script>
 </body>
 </html>

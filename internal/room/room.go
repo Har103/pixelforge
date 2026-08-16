@@ -52,7 +52,31 @@ type Room struct {
 	bans   map[string]bool
 	locks  []Lock
 	paused bool
+
+	// cursors is deliberately ephemeral: where somebody's pointer is right now
+	// is interesting for a second and worthless afterwards, so it never touches
+	// the database and never survives a restart. Seeing other people move is
+	// what makes a shared canvas feel like a room rather than a page that
+	// updates, and it is the cheapest possible way to convey that.
+	curMu    sync.Mutex
+	cursors  map[string]Cursor
+	curDirty bool
 }
+
+// Cursor is one painter's pointer position and the colour they have selected,
+// so their cursor shows what they are about to paint.
+type Cursor struct {
+	UID    string `json:"u"`
+	X      int    `json:"x"`
+	Y      int    `json:"y"`
+	Colour uint8  `json:"k"`
+	at     time.Time
+}
+
+// cursorTTL is how long a pointer stays on screen after its owner stops moving.
+// Long enough to survive a pause for thought, short enough that a closed tab
+// does not leave a ghost.
+const cursorTTL = 6 * time.Second
 
 // Lock is a rectangle the owner has frozen. Coordinates are inclusive.
 type Lock struct {
@@ -137,6 +161,53 @@ func (r *Room) locked(x, y int) bool {
 	return false
 }
 
+// SetCursor records where a painter's pointer is. Out-of-range coordinates are
+// dropped rather than clamped: a cursor at the edge because the client sent
+// nonsense is more confusing than no cursor at all.
+func (r *Room) SetCursor(uid string, x, y int, colour uint8) {
+	if uid == "" || x < 0 || y < 0 || x >= r.Canvas.Width() || y >= r.Canvas.Height() {
+		return
+	}
+	r.curMu.Lock()
+	prev, existed := r.cursors[uid]
+	if !existed || prev.X != x || prev.Y != y || prev.Colour != colour {
+		r.curDirty = true
+	}
+	r.cursors[uid] = Cursor{UID: uid, X: x, Y: y, Colour: colour, at: time.Now()}
+	r.curMu.Unlock()
+}
+
+// DropCursor removes a painter's pointer, called when their socket closes so
+// the last position does not linger for the full TTL.
+func (r *Room) DropCursor(uid string) {
+	r.curMu.Lock()
+	if _, ok := r.cursors[uid]; ok {
+		delete(r.cursors, uid)
+		r.curDirty = true
+	}
+	r.curMu.Unlock()
+}
+
+// liveCursors returns the cursors still within the TTL, expiring the rest.
+func (r *Room) liveCursors() ([]Cursor, bool) {
+	now := time.Now()
+	r.curMu.Lock()
+	defer r.curMu.Unlock()
+
+	out := make([]Cursor, 0, len(r.cursors))
+	for uid, c := range r.cursors {
+		if now.Sub(c.at) > cursorTTL {
+			delete(r.cursors, uid)
+			r.curDirty = true
+			continue
+		}
+		out = append(out, c)
+	}
+	dirty := r.curDirty
+	r.curDirty = false
+	return out, dirty
+}
+
 // Touch records that somebody is using this room, which keeps it resident and
 // orders it on the browse page.
 func (r *Room) Touch() { r.lastTouch.Store(time.Now().UnixNano()) }
@@ -199,6 +270,81 @@ func (r *Room) UndoPainter(ctx context.Context, uid string) (int64, error) {
 	return n, nil
 }
 
+// Errors from UndoOwn that the caller turns into a message.
+var (
+	ErrNothingToUndo = errors.New("room: you have not painted anything here yet")
+	ErrPaintedOver   = errors.New("room: somebody has painted over that since")
+)
+
+// UndoOwn reverts a painter's most recent placement and restores whatever was
+// underneath it, from the log rather than from a guess.
+//
+// It refuses when somebody else has painted over the cell in the meantime.
+// Silently reverting to a colour a third party chose after you would be a
+// stranger's pixel disappearing because you clicked undo, which is worse than
+// being told no.
+func (r *Room) UndoOwn(ctx context.Context, uid string) (canvas.Pixel, error) {
+	mine, err := r.store.LatestOwnPlacement(ctx, r.Meta.ID, uid)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return canvas.Pixel{}, ErrNothingToUndo
+		}
+		return canvas.Pixel{}, err
+	}
+
+	top, err := r.store.TopPlacementAt(ctx, r.Meta.ID, mine.X, mine.Y)
+	if err != nil {
+		return canvas.Pixel{}, err
+	}
+	if top.Seq != mine.Seq {
+		return canvas.Pixel{}, ErrPaintedOver
+	}
+
+	beneath, err := r.store.ColourBeneath(ctx, r.Meta.ID, mine.X, mine.Y, mine.Seq)
+	if err != nil {
+		return canvas.Pixel{}, err
+	}
+	if err := r.store.MarkUndone(ctx, r.Meta.ID, mine.Seq); err != nil {
+		return canvas.Pixel{}, err
+	}
+
+	// Clear the cooldown before applying, not only after. Whoever presses undo
+	// is almost always still cooling down from the pixel they are taking back,
+	// and a placement refused for that reason would leave the undo unbroadcast:
+	// every open tab would keep showing a pixel the log says is gone.
+	r.ClearCooldown(uid)
+
+	// Apply as a fresh placement so every connected client sees it.
+	px, err := r.Canvas.Place(mine.X, mine.Y, beneath, uid, time.Now())
+	if err != nil {
+		// The cell already holds that colour, which can happen if the canvas
+		// was rebuilt underneath us. Nothing to broadcast, but the log is right.
+		r.Canvas.Apply(mine.X, mine.Y, beneath, r.Canvas.Seq())
+		px = canvas.Pixel{X: mine.X, Y: mine.Y, Color: beneath, UID: uid}
+	} else {
+		r.Hub.Publish(px)
+	}
+	// Applying it re-armed the cooldown, so clear it once more: undoing a
+	// misclick must not cost the painter their turn.
+	r.ClearCooldown(uid)
+	r.Touch()
+
+	// The repair is deliberately not appended to the log. An undo is a
+	// retraction of a placement, not a placement of its own, and a row for it
+	// would become the painter's most recent placement - so their next undo
+	// would take back the repair instead of the pixel before it. Durability
+	// comes from a snapshot instead, the way Clear and UndoPainter get it:
+	// without one, a restart could replay an older snapshot and paint the
+	// undone pixel straight back.
+	if err := r.snapshot(ctx); err != nil {
+		r.log.Error("snapshotting after an undo", "room", r.Meta.Slug, "err", err)
+	}
+	return px, nil
+}
+
+// ClearCooldown lets a painter act again immediately. Used after an undo.
+func (r *Room) ClearCooldown(uid string) { r.Canvas.ClearCooldown(uid) }
+
 // rebuild replays the surviving log from an empty grid.
 func (r *Room) rebuild(ctx context.Context) error {
 	r.Canvas.Clear()
@@ -232,11 +378,35 @@ func (r *Room) snapshot(ctx context.Context) error {
 	})
 }
 
-// run drives the room's two background loops until stop is called.
+// run drives the room's background loops until stop is called.
 func (r *Room) run() {
-	r.wg.Add(2)
+	r.wg.Add(3)
 	go func() { defer r.wg.Done(); r.Hub.Run(r.hubDone) }()
 	go func() { defer r.wg.Done(); r.writeBehind() }()
+	go func() { defer r.wg.Done(); r.broadcastCursors() }()
+}
+
+// broadcastCursors ships pointer positions on a slower tick than placements.
+// Cursors are cosmetic, so they get a coarser rate and are skipped entirely
+// when nothing has moved - an idle room should cost nothing.
+func (r *Room) broadcastCursors() {
+	t := time.NewTicker(120 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-r.stopped:
+			return
+		case <-t.C:
+			if r.Hub.Count() == 0 {
+				continue
+			}
+			cursors, changed := r.liveCursors()
+			if !changed {
+				continue
+			}
+			r.Hub.BroadcastJSON(map[string]any{"t": "cursors", "c": cursors})
+		}
+	}
 }
 
 // writeBehind batches placements into the database so painting never waits on

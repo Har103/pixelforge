@@ -63,6 +63,30 @@ they painted over restored from the log rather than guessed. Per-address rate
 limiting backs up the per-painter cooldown, which a script defeats by throwing
 its cookie away.
 
+**You can see each other.** Everybody's pointer shows on the canvas in their own
+colour, on a 120&nbsp;ms tick. Cursors are never written down: where somebody is
+about to click is interesting for a second and worthless afterwards, so they
+live in memory, expire after six, and vanish when the socket closes.
+
+**Every pixel has a history.** Shift-click any cell to see who painted it, what
+was underneath, and when. A canvas nobody can ask that of is a grid; being able
+to ask is what makes it a place — and it is also what makes moderation
+something other than guesswork.
+
+**Undo, without stealing.** Ctrl/⌘+Z takes back your last pixel and restores
+what was under it, read from the placement log rather than guessed, and gives
+you your turn back so a misclick does not cost you the cooldown. It refuses if
+somebody has painted over you since. Taking back your pixel should never quietly
+erase theirs, and being told no is better than a stranger's work disappearing.
+
+**Trace an image.** Drop a picture on the canvas and it is fitted, quantised to
+the room's palette — Floyd–Steinberg, Atkinson, ordered Bayer or flat, under a
+redmean colour metric — and drawn underneath as a ghost. <kbd>N</kbd> sends you
+to the unpainted cell nearest the middle of it and picks the colour that cell
+needs, so tracing is click, click, click. The image is decoded in your browser
+and never uploaded: what you are copying is nobody else's business, least of all
+the server's.
+
 **Live, two ways.** WebSocket by default, with an automatic fallback to
 Server-Sent Events for networks that will not carry an upgrade; there is a
 toggle in the room so you can watch both paths work. Updates are coalesced on a
@@ -82,6 +106,10 @@ green, because a constraint is often what makes the picture.
 <td><img src="docs/manage.png" alt="The moderation panel"></td>
 </tr>
 </table>
+
+![Tracing a reference image: the ghost is quantised to the room's palette, and the panel tracks how much of it is painted](docs/template.png)
+
+![Somebody else's pointer on the canvas, and the history of a single cell](docs/together.png)
 
 ## Sharing
 
@@ -295,6 +323,8 @@ limit will bite; fix the proxy rather than raising the number.
 | `GET` | `/api/r/{slug}/snapshot` | The whole grid as one binary blob |
 | `POST` | `/api/r/{slug}/place` | `{"x":1,"y":2,"c":7}` → `200`, or `429` with `retryInMs` |
 | `GET` | `/api/r/{slug}/history` | Placement log, oldest first |
+| `GET` | `/api/r/{slug}/pixel?x=&y=` | Who painted this cell, and what was under it |
+| `POST` | `/api/r/{slug}/undo` | Take back your own last pixel. `409` if somebody painted over it |
 | `GET` | `/api/r/{slug}/stats` | Canvas stats, painter leaderboard |
 | `GET` | `/api/r/{slug}/ws` | WebSocket: binary pixel batches out, placements in |
 | `GET` | `/api/r/{slug}/sse` | Server-Sent Events, JSON only |
@@ -325,7 +355,15 @@ against roughly 1.5 MB for the equivalent JSON.
 ```
 
 **Control messages** (WebSocket text frames and every SSE event) are JSON:
-`{"t":"hello"|"presence"|"px"|"denied", …}`.
+`{"t":"hello"|"presence"|"px"|"denied"|"cursors"|"locks"|"room", …}`. The client
+sends `{"t":"place"}`, `{"t":"cur"}` and `{"t":"curoff"}` back up the socket.
+
+Cursor traffic skips the rate limiter and is coalesced onto its own tick, which
+is safe precisely because it is never stored: the worst a flood can do is
+overwrite a value in a map that expires in six seconds either way. It is also
+the one message the client will drop rather than queue — a pointer position that
+missed its moment is worse than useless, and sending it late is how a live
+cursor starts to feel like lag.
 
 Colours are palette indices, never RGB. The palette lives in `internal/canvas`
 and is served to the client at startup, which is why a cell is one byte and why
@@ -335,11 +373,32 @@ a client cannot smuggle in an arbitrary colour.
 
 ```sh
 go test -race ./...                                   # everything that needs no database
-PIXELFORGE_TEST_DSN=postgres://… go test -race ./...  # plus the API integration tests
+PIXELFORGE_TEST_DSN=postgres://… go test -race ./...  # plus the database and browser suites
 ```
 
-The API tests need a real PostgreSQL, because rooms are a database concept and
-mocking the store would only test the mock. They skip cleanly without a DSN.
+The database tests need a real PostgreSQL, because rooms are a database concept
+and mocking the store would only test the mock. They skip cleanly without a DSN.
+
+**The browser suite is real.** `internal/e2e` launches headless Chrome, drives
+it over the DevTools Protocol and asserts on a page a person could have clicked.
+It has no dependencies either: CDP is carried over a WebSocket client written
+against the same RFC as the server in `internal/ws`, so the tests and the
+product exercise the same understanding of the protocol. Point it at a browser
+with `PIXELFORGE_E2E_CHROME`, or let it find one; with no browser anywhere it
+skips rather than fails, and CI pins the path explicitly so a silent skip cannot
+masquerade as a pass.
+
+It catches the class of bug that unit tests structurally cannot — every item
+here is a regression this project actually shipped:
+
+- a Content-Security-Policy violation that left every room loading the wrong
+  canvas, visible only as a console entry in a real browser
+- a "hidden" overlay whose `display: grid` outranked `[hidden]`, silently
+  swallowing every click on the page
+- a topbar that overflowed a 390&nbsp;px viewport
+- an export that answered `200` with an empty body
+- pointer capture on the stage retargeting `pointerup`, which killed every
+  control drawn over the canvas *and* painted the cell underneath instead
 
 Worth singling out:
 
@@ -354,8 +413,17 @@ Worth singling out:
   stranger, accepts the creator's cookie, and accepts the recovery link's key
   from a browser that has never seen the room
 - `TestBanAndUndo` — undoing a painter restores what they painted over, from the log
+- `TestUndoPutsBackWhatWasUnderneath` — a stranger paints, you paint over them,
+  Ctrl+Z in a real browser restores *their* colour; then they paint over you and
+  the same key is refused
+- `TestTemplateOverlayTracesAnImageWithoutUploadingIt` — builds an image in the
+  page, drops it on the canvas, and asserts from recorded network traffic that
+  no request ever carried it
 - `TestZeroCooldownIsHonoured` and `TestRoomPageHasNoInlineScript` — two
   regressions with stories, described where they live
+- `Migrate` takes a PostgreSQL advisory lock: `create table if not exists` is
+  not atomic against a concurrent creator, so two replicas starting together —
+  or two test binaries — could race and one would die on a duplicate key
 - The WebSocket protocol-violation suite — unmasked frames, reserved bits,
   oversized control frames, invalid UTF-8, each expecting a specific close code
 
